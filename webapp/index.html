@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Архив</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:var(--tg-theme-bg-color,#fff);--bg2:var(--tg-theme-secondary-bg-color,#f1f1f4);--tx:var(--tg-theme-text-color,#111);--hint:var(--tg-theme-hint-color,#8a8a8e);--link:var(--tg-theme-link-color,#2a7ae2);--btn:var(--tg-theme-button-color,#2a7ae2);--btx:var(--tg-theme-button-text-color,#fff);--del:#e5484d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.4 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;-webkit-text-size-adjust:100%}
+header{position:sticky;top:0;z-index:2;background:var(--bg);padding:10px 12px;border-bottom:1px solid var(--bg2);display:flex;gap:8px;align-items:center}
+header h1{font-size:17px;margin:0;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+button,input{font:inherit;color:inherit}
+.ib{border:0;background:var(--bg2);border-radius:10px;padding:7px 11px;cursor:pointer}
+.ib:disabled{opacity:.35}
+#q{width:100%;border:0;border-radius:10px;background:var(--bg2);padding:9px 12px;outline:none}
+.list{list-style:none;margin:0;padding:0}
+.row{padding:11px 14px;border-bottom:1px solid var(--bg2);cursor:pointer}
+.row b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row small{color:var(--hint)}
+.msgs{padding:8px 10px 24px;display:flex;flex-direction:column;gap:6px}
+.m{max-width:86%;padding:7px 10px;border-radius:14px;background:var(--bg2);word-wrap:break-word;white-space:pre-wrap}
+.m.me{align-self:flex-end;background:color-mix(in srgb,var(--btn) 18%,var(--bg))}
+.m.del{outline:2px solid var(--del)}
+.meta{font-size:12px;color:var(--hint);margin-top:3px;white-space:normal}
+.meta .d{color:var(--del);font-weight:600}
+.was{font-size:13px;color:var(--hint);border-left:3px solid var(--hint);padding-left:7px;margin-top:4px}
+.who{font-size:12px;font-weight:600;color:var(--link)}
+.m img,.m video{display:block;max-width:100%;max-height:340px;border-radius:10px;margin:2px 0 4px}
+.m video.note{width:220px;height:220px;border-radius:50%;object-fit:cover}
+.m audio{width:240px;max-width:100%;display:block;margin:2px 0}
+.daybar{display:flex;gap:6px;align-items:center;padding:8px 12px;background:var(--bg);position:sticky;top:53px;z-index:1;border-bottom:1px solid var(--bg2)}
+.daybar span{flex:1;text-align:center;font-weight:600}
+.daybar input{position:absolute;opacity:0;width:1px;height:1px}
+.more{display:block;margin:10px auto;border:0;background:var(--btn);color:var(--btx);border-radius:10px;padding:9px 16px;cursor:pointer}
+.empty{padding:40px 20px;text-align:center;color:var(--hint)}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<header><button class="ib hide" id="back">‹</button><h1 id="title">Архив</h1><button class="ib" id="sbtn">🔍</button></header>
+<div id="search" class="hide" style="padding:8px 12px"><input id="q" type="search" placeholder="Поиск по всем чатам" enterkeyhint="search"></div>
+<main id="view"></main>
+<script>
+const tg = window.Telegram && Telegram.WebApp; if (tg) { tg.ready(); tg.expand(); }
+const $ = s => document.querySelector(s), view = $('#view');
+let token = '', stack = [];
+const NET = 'Не загрузилось: связь до сервера рвётся (так бывает без VPN у части провайдеров). Попробуй ещё раз или листай архив прямо в чате с ботом: команда /chats.';
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+const empty = t => { view.replaceChildren(el('div', 'empty', t)); };
+function tfetch(url, opts = {}, ms = 9000) { const c = new AbortController(), k = setTimeout(() => c.abort(), ms); return fetch(url, { ...opts, signal: c.signal, cache: 'no-store' }).finally(() => clearTimeout(k)); }
+async function api(path) {
+  for (let i = 0; i < 5; i++) {
+    try { const r = await tfetch('api/' + path, { headers: { Authorization: 'Bearer ' + token } });
+      if (r.status === 401) { await login(); continue; }
+      if (!r.ok) throw new Error(r.status); return await r.json(); }
+    catch (e) { if (i === 4) throw e; await new Promise(z => setTimeout(z, 800 * (i + 1))); }
+  }
+}
+async function login() {
+  for (let i = 0; ; i++) {
+    try {
+      const r = await tfetch('api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ initData: tg ? tg.initData : '' }) });
+      if (r.status === 401) throw new Error('denied');
+      if (!r.ok) throw new Error(r.status); const j = await r.json(); token = j.token; return j;
+    } catch (e) { if (e.message === 'denied' || i === 4) throw e; await new Promise(z => setTimeout(z, 800 * (i + 1))); }
+  }
+}
+function setTitle(t, canBack) { $('#title').textContent = t; $('#back').classList.toggle('hide', !canBack);
+  if (tg && tg.BackButton) canBack ? tg.BackButton.show() : tg.BackButton.hide(); }
+function go(fn) { stack.push(fn); fn(); }
+function back() { stack.pop(); const f = stack[stack.length - 1]; if (f) f(); }
+$('#back').onclick = back; if (tg && tg.BackButton) tg.BackButton.onClick(back);
+$('#sbtn').onclick = () => { $('#search').classList.toggle('hide'); if (!$('#search').classList.contains('hide')) $('#q').focus(); };
+$('#q').addEventListener('keydown', e => { if (e.key === 'Enter') { const q = $('#q').value.trim(); if (q.length > 1) { $('#q').blur(); go(() => showSearch(q)); } } });
+
+async function showChats() {
+  setTitle('Архив', false); empty('Загружаю…');
+  const ul = el('ul', 'list'); let offset = 0;
+  const more = el('button', 'more', 'Ещё чаты');
+  async function load() {
+    const j = await api('chats?offset=' + offset); offset += j.chats.length;
+    for (const c of j.chats) {
+      const li = el('li', 'row'); li.append(el('b', '', c.title || 'без имени'));
+      li.append(el('small', '', `${c.last.replace('T', ' ')} · ${c.n} сообщ.` + (c.del ? ` · 🗑 ${c.del}` : '')));
+      li.onclick = () => go(() => showChat(c.id, c.title)); ul.append(li);
+    }
+    more.classList.toggle('hide', !j.more);
+  }
+  more.onclick = load;
+  try { await load(); view.replaceChildren(ul, more); if (!ul.children.length) empty('Пока пусто. Подключи бота через Telegram для бизнеса, и переписки начнут сохраняться.'); }
+  catch (e) { empty(NET); }
+}
+function fmtDay(d) { const [y, m, dd] = d.split('-'); return `${dd}.${m}.${y}`; }
+const CHUNK = 15000, blobs = new Map();
+async function piece(src, a, b) {
+  for (let k = 0; k < 4; k++) {
+    try { const r = await tfetch(src, { headers: { Range: `bytes=${a}-${b}` } });
+      if (r.status === 206 || r.status === 200) return r; } catch (e) {}
+    await new Promise(z => setTimeout(z, 700 * (k + 1)));
+  }
+  throw new Error('chunk');
+}
+async function fetchBlob(src, onProgress) {
+  if (blobs.has(src)) return blobs.get(src);
+  const first = await piece(src, 0, CHUNK - 1);
+  const type = first.headers.get('Content-Type') || '';
+  const cr = first.headers.get('Content-Range'), total = cr ? +cr.split('/')[1] : 0;
+  const parts = [await first.arrayBuffer()];
+  if (total > CHUNK) {
+    if (total > 15e6) throw new Error('big');
+    const starts = []; for (let s = CHUNK; s < total; s += CHUNK) starts.push(s);
+    const out = new Array(starts.length); let done = 0, next = 0;
+    async function worker() { while (next < starts.length) { const n = next++, s = starts[n];
+      out[n] = await (await piece(src, s, Math.min(s + CHUNK, total) - 1)).arrayBuffer(); done++; onProgress && onProgress(done / starts.length); } }
+    await Promise.all(Array.from({ length: 6 }, worker)); parts.push(...out);
+  }
+  const url = URL.createObjectURL(new Blob(parts, { type })); blobs.set(src, url); return url;
+}
+async function toChat(chat, m, btn) {
+  btn.disabled = true; btn.textContent = '…';
+  try { const r = await tfetch('api/send', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token }, body: JSON.stringify({ chat, id: m.id }) });
+    btn.textContent = r.ok ? '✓ отправил в чат с ботом' : 'не вышло'; } catch (e) { btn.textContent = 'не вышло'; btn.disabled = false; }
+}
+function mediaNode(chat, m) {
+  if (!m.file) return m.media ? el('div', 'meta', `[${m.media}]`) : null;
+  const src = `api/media?chat=${chat}&id=${m.id}&t=${encodeURIComponent(token)}`;
+  const box = el('div'), play = el('button', 'ib', '');
+  const send = el('button', 'ib', '📩 в чат'); send.style.marginLeft = '6px'; send.onclick = () => toChat(chat, m, send);
+  const isPic = m.kind === 'photo', isVid = ['video', 'video_note', 'animation'].includes(m.kind), isAud = ['voice', 'audio'].includes(m.kind);
+  play.textContent = isPic ? '🖼 фото' : isVid ? (m.kind === 'video_note' ? '⭕ кружок' : '🎬 видео') : isAud ? '🎤 ' + (m.media || 'аудио') : '📎 ' + (m.media || 'файл');
+  async function load(auto) {
+    play.disabled = true; play.textContent = 'загружаю…';
+    try {
+      const url = await fetchBlob(src, p => { play.textContent = `загружаю ${Math.round(p * 100)}%`; });
+      let node;
+      if (isPic) { node = el('img'); node.onclick = () => open(url); }
+      else if (isVid) { node = el('video', m.kind === 'video_note' ? 'note' : ''); node.controls = true; node.playsInline = true; if (!auto) node.autoplay = true; }
+      else if (isAud) { node = el('audio'); node.controls = true; if (!auto) node.autoplay = true; }
+      else { node = el('a', '', '📎 открыть ' + (m.media || 'файл')); node.href = url; node.download = ''; }
+      if (node.tagName !== 'A') node.src = url;
+      box.replaceChild(node, play);
+    } catch (e) { play.disabled = false; play.textContent = e.message === 'big' ? 'большой файл, жми «в чат»' : 'не загрузилось, ещё раз'; }
+  }
+  play.onclick = () => load(false);
+  box.append(play, send);
+  if (isPic) { const io = new IntersectionObserver(es => { if (es[0].isIntersecting) { io.disconnect(); load(true); } }); io.observe(box); }
+  return box;
+}
+function bubble(chat, m, showWho) {
+  const b = el('div', 'm' + (m.me ? ' me' : '') + (m.del ? ' del' : ''));
+  if (showWho) b.append(el('div', 'who', m.from || ''));
+  const md = mediaNode(chat, m); if (md) b.append(md);
+  if (m.text) b.append(document.createTextNode(m.text));
+  if (m.ed && m.was != null) b.append(el('div', 'was', 'было: ' + m.was));
+  const meta = el('div', 'meta', m.t + (m.ed ? ' · ✏️ изменено' : ''));
+  if (m.del) meta.append(' · ', el('span', 'd', '🗑 удалено'));
+  b.append(meta); return b;
+}
+async function showChat(chat, title, day) {
+  setTitle(title || 'Чат', true); empty('Загружаю…');
+  let days;
+  try { days = (await api('days?chat=' + chat)).days.map(x => x[0]); } catch (e) { empty(NET); return; }
+  if (!days.length) { empty('В этом чате пусто.'); return; }
+  let i = day ? days.indexOf(day) : days.length - 1; if (i < 0) i = days.findIndex(d => d >= day); if (i < 0) i = days.length - 1;
+  const bar = el('div', 'daybar'), prev = el('button', 'ib', '◀'), next = el('button', 'ib', '▶'), lbl = el('span'), cal = el('button', 'ib', '📅'), pick = el('input');
+  pick.type = 'date'; pick.min = days[0]; pick.max = days[days.length - 1];
+  bar.append(prev, lbl, next, cal, pick);
+  const box = el('div', 'msgs'), more = el('button', 'more hide', 'Показать ещё');
+  view.replaceChildren(bar, box, more);
+  let after = 0;
+  async function load(reset) {
+    if (reset) { after = 0; box.replaceChildren(el('div', 'empty', 'Загружаю…')); }
+    const j = await api(`messages?chat=${chat}&day=${days[i]}&after=${after}`);
+    if (reset) box.replaceChildren();
+    for (const m of j.messages) box.append(bubble(chat, m, !m.me));
+    if (j.messages.length) after = j.messages[j.messages.length - 1].id;
+    more.classList.toggle('hide', !j.more);
+  }
+  function show() { lbl.textContent = fmtDay(days[i]); prev.disabled = i === 0; next.disabled = i === days.length - 1; pick.value = days[i];
+    load(true).catch(() => box.replaceChildren(el('div', 'empty', NET))); scrollTo(0, 0); }
+  prev.onclick = () => { if (i > 0) { i--; show(); } }; next.onclick = () => { if (i < days.length - 1) { i++; show(); } };
+  more.onclick = () => load(false);
+  cal.onclick = () => { if (pick.showPicker) pick.showPicker(); else pick.focus(); };
+  pick.onchange = () => { const d = pick.value; if (!d) return; let k = days.findIndex(x => x >= d); if (k < 0) k = days.length - 1; i = k; show(); };
+  show();
+}
+async function showSearch(q) {
+  setTitle('Поиск: ' + q, true); empty('Ищу…');
+  const box = el('ul', 'list'), more = el('button', 'more hide', 'Ещё'); let offset = 0;
+  async function load() {
+    const j = await api(`search?q=${encodeURIComponent(q)}&offset=${offset}`); offset += j.results.length;
+    for (const r of j.results) {
+      const li = el('li', 'row'); li.append(el('b', '', r.title || ''));
+      li.append(el('small', '', `${fmtDay(r.d)} ${r.t} · ${r.from || ''}` + (r.del ? ' · 🗑' : '') + (r.ed ? ' · ✏️' : '')));
+      li.append(el('div', '', r.text)); li.onclick = () => go(() => showChat(r.chat, r.title, r.d)); box.append(li);
+    }
+    more.classList.toggle('hide', !j.more);
+  }
+  more.onclick = load;
+  try { await load(); view.replaceChildren(box, more); if (!box.children.length) empty('Ничего не нашёл.'); } catch (e) { empty(NET); }
+}
+(async () => {
+  if (!tg || !tg.initData) { empty('Открой архив из бота @mmrool_archive_bot, кнопка «Архив».'); return; }
+  try { const j = await login(); if (!j.has_archive) { empty('Архива пока нет. Подключи бота: Настройки → Telegram для бизнеса → Чат-боты → @mmrool_archive_bot.'); return; } go(showChats); }
+  catch (e) { empty(NET); }
+})();
+</script>
+</body>
+</html>

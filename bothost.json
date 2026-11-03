@@ -1,0 +1,5 @@
+{
+  "main": "archive_bot.py",
+  "language": "python",
+  "python_version": "3.13"
+}
