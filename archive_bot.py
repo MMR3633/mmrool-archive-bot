@@ -823,7 +823,8 @@ async def cmd_login(msg: Message, bot: Bot):
     from aiogram.types import BufferedInputFile
     await bot.send_photo(msg.chat.id, BufferedInputFile(png, "login.png"), parse_mode=None,
                          caption="Чтобы я мог открывать каналы как ты: на телефоне Настройки → Устройства → "
-                                 "Подключить устройство и наведи камеру на этот код. Код живёт 3 минуты.")
+                                 "Подключить устройство и наведи камеру на этот код (код открой на компьютере). "
+                                 "Код живёт 3 минуты. Если компьютера рядом нет, войди по коду: /phone +7XXXXXXXXXX")
     result = await USER.wait_qr()
     if result == "ok":
         await answer(msg, "Подключил. Теперь кидай ссылки на посты, качаю сам.")
@@ -832,6 +833,43 @@ async def cmd_login(msg: Message, bot: Bot):
                           "(сообщение с паролем я сразу удалю).")
     else:
         await answer(msg, "Код истёк. Напиши /login ещё раз.")
+
+
+@router.message(Command("phone"), F.func(lambda m: m.from_user and m.from_user.id == OWNER_ID))
+async def cmd_phone(msg: Message, bot: Bot):
+    phone = re.sub(r"[^\d+]", "", (msg.text or "").partition(" ")[2])
+    if len(re.sub(r"\D", "", phone)) < 10:
+        await answer(msg, "Напиши так: /phone +79991234567")
+        return
+    if not phone.startswith("+"):
+        phone = "+" + phone
+    try:
+        await USER.send_code(phone)
+    except Exception as e:
+        await answer(msg, f"Не смог запросить код: {html.escape(str(e))}")
+        return
+    await answer(msg, "Telegram прислал тебе код входа (в чат «Telegram»). Пришли его сюда <b>с пробелами между цифрами</b>, "
+                      "например: 1 2 3 4 5. Без пробелов Telegram сочтёт, что код украли, и отменит его.")
+
+
+@router.message(F.func(lambda m: m.from_user and m.from_user.id == OWNER_ID and USER is not None
+                       and getattr(USER, "pending_phone", None) and re.fullmatch(r"[\d\s.\-]{5,20}", m.text or "")))
+async def on_login_code(msg: Message, bot: Bot):
+    code = re.sub(r"\D", "", msg.text or "")
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    try:
+        result = await USER.sign_in_code(code)
+    except Exception as e:
+        await answer(msg, f"Код не подошёл: {html.escape(str(e))}. Напиши /phone ещё раз.")
+        return
+    USER.pending_phone = None if result == "ok" else USER.pending_phone
+    if result == "ok":
+        await answer(msg, "Подключил. Теперь кидай ссылки на посты, качаю сам.")
+    else:
+        await answer(msg, "У аккаунта стоит облачный пароль. Пришли его так: /pass твой_пароль (сообщение сразу удалю).")
 
 
 @router.message(Command("pass"), F.func(lambda m: m.from_user and m.from_user.id == OWNER_ID))

@@ -21,6 +21,7 @@ class UserClient:
         self.data_dir = data_dir
         self.client = None
         self.pending_qr = None
+        self.pending_phone = None
         self.lock = asyncio.Lock()
 
     async def start(self):
@@ -63,6 +64,20 @@ class UserClient:
 
     async def password(self, pwd):
         await self.client.sign_in(password=pwd)
+
+    async def send_code(self, phone):
+        if not self.client.is_connected():
+            await self.client.connect()
+        sent = await self.client.send_code_request(phone)
+        self.pending_phone = (phone, sent.phone_code_hash)
+
+    async def sign_in_code(self, code):
+        phone, code_hash = self.pending_phone
+        try:
+            await self.client.sign_in(phone=phone, code=code, phone_code_hash=code_hash)
+            return "ok"
+        except SessionPasswordNeededError:
+            return "password"
 
     async def download_post(self, private, internal, username, msg_id):
         peer = int(f"-100{internal}") if private else username
