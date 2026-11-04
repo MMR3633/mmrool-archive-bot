@@ -26,7 +26,8 @@ class UserClient:
 
     async def start(self):
         self.client = TelegramClient(str(self.data_dir / "user"), API_ID, API_HASH,
-                                     connection_retries=3, retry_delay=5, auto_reconnect=True)
+                                     connection_retries=3, retry_delay=5, auto_reconnect=True,
+                                     receive_updates=False)
         try:
             await self.client.connect()
         except Exception as e:
