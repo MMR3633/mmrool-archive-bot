@@ -24,7 +24,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 STORE_CHAT_ID = int(os.environ.get("STORE_CHAT_ID", "0"))
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
-WEB_PORT = int(os.environ.get("WEB_PORT") or os.environ.get("PORT") or "0")
+WEB_PORT = int(os.environ.get("PORT") or os.environ.get("WEB_PORT") or "0")
 MAX_DOWNLOAD = 20 * 1024 * 1024
 MSK = timezone(timedelta(hours=3))
 
