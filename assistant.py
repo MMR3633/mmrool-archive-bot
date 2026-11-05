@@ -941,6 +941,14 @@ async def cmd_help(msg: Message):
 
 
 async def loops(bot: Bot):
+    try:
+        import av  # noqa: F401
+        import faster_whisper  # noqa: F401
+        log.info("помощник: распознавание ГС готово, модель %s", __import__("os").environ.get("WHISPER_MODEL", "base"))
+    except Exception as e:
+        WHISPER["broken"] = True
+        log.warning("помощник: распознавание ГС недоступно: %s", e)
+    log.info("помощник: ключ для умного режима %s", "есть" if llm.enabled() else "не задан, работаю на правилах")
     asyncio.create_task(reminder_loop(bot))
     while True:
         for tick in (busy_tick, birthday_tick, digest_tick):
