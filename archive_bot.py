@@ -4,7 +4,11 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 from contextlib import contextmanager
+
+if __name__ == "__main__":
+    sys.modules.setdefault("archive_bot", sys.modules[__name__])
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
