@@ -571,29 +571,9 @@ async def cmd_digest(msg: Message):
 
 # ---------- ГС в текст ----------
 
-def _decode(path):
-    import av
-    import numpy as np
-    c = av.open(path)
-    r = av.AudioResampler(format="s16", layout="mono", rate=16000)
-    chunks = []
-    for frame in c.decode(audio=0):
-        for out in r.resample(frame):
-            chunks.append(out.to_ndarray().flatten())
-    c.close()
-    if not chunks:
-        return np.zeros(1, dtype="float32")
-    return np.concatenate(chunks).astype("float32") / 32768
-
-
 def _transcribe(path):
-    import os
-    from faster_whisper import WhisperModel
-    if WHISPER["model"] is None:
-        WHISPER["model"] = WhisperModel(os.environ.get("WHISPER_MODEL", "base"), device="cpu", compute_type="int8",
-                                        download_root=str(ab.DATA / "whisper"), cpu_threads=2)
-    segments, _ = WHISPER["model"].transcribe(_decode(path), language="ru", beam_size=1, vad_filter=True)
-    return " ".join(s.text.strip() for s in segments).strip()
+    import stt
+    return stt.transcribe(path, download_root=str(ab.DATA / "whisper"))
 
 
 def voice_card(icon, who, when, text):
@@ -1095,11 +1075,21 @@ async def cmd_help(msg: Message):
     await ab.answer(msg, HELP)
 
 
+async def warm_whisper():
+    import stt
+    try:
+        await asyncio.to_thread(stt.load, str(ab.DATA / "whisper"))
+    except Exception as e:
+        log.warning("помощник: модель распознавания не загрузилась: %s", e)
+
+
 async def loops(bot: Bot):
     try:
         import av  # noqa: F401
         import faster_whisper  # noqa: F401
-        log.info("помощник: распознавание ГС готово, модель %s", __import__("os").environ.get("WHISPER_MODEL", "base"))
+        import stt
+        log.info("помощник: распознавание ГС, модель %s, луч %s, прогреваю в фоне", stt.MODEL_NAME, stt.BEAM)
+        asyncio.create_task(warm_whisper())
     except Exception as e:
         WHISPER["broken"] = True
         log.warning("помощник: распознавание ГС недоступно: %s", e)
