@@ -8,7 +8,7 @@ from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import ReplyParameters, BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import archive_bot as ab
 import llm
@@ -58,6 +58,9 @@ def init_db():
                 if o:
                     con.execute("INSERT OR IGNORE INTO assistant_settings (owner_id, voice) VALUES (?, 1)", (o,))
             con.execute("INSERT INTO assistant_meta VALUES ('voice_default_v9', '1')")
+        if not con.execute("SELECT 1 FROM assistant_meta WHERE key='voice_default_v10'").fetchone():
+            con.execute("UPDATE assistant_settings SET voice=0 WHERE owner_id<>?", (ab.OWNER_ID,))
+            con.execute("INSERT INTO assistant_meta VALUES ('voice_default_v10', '1')")
 
 
 def now():
@@ -114,7 +117,7 @@ def setting(owner, key):
 
 def set_setting(owner, key, value):
     with ab.db() as con:
-        con.execute("INSERT OR IGNORE INTO assistant_settings (owner_id) VALUES (?)", (owner,))
+        con.execute("INSERT OR IGNORE INTO assistant_settings (owner_id, voice) VALUES (?, 0)", (owner,))
         con.execute(f"UPDATE assistant_settings SET {key}=? WHERE owner_id=?", (value, owner))
 
 
@@ -302,6 +305,8 @@ async def cmd_reminders(msg: Message, bot: Bot):
     for r in rows[:20]:
         await send(bot, msg.chat.id, f"⏰ {html.escape(r['title'])} · {fmt(parse_iso(r['due']))}",
                    kb([("Отменить", f"rem:cancel:{r['id']}")]))
+    if len(rows) > 20:
+        await send(bot, msg.chat.id, f"Показал 20 ближайших из {len(rows)}.")
 
 
 # ---------- задачи ----------
@@ -343,8 +348,10 @@ async def cmd_tasks(msg: Message, bot: Bot):
         await ab.answer(msg, "Открытых задач нет. Добавить: ответь на любое сообщение в чате «+задача».")
         return
     for t in rows[:30]:
-        await send(bot, msg.chat.id, f"📝 {html.escape(t['text'][:500])}\n<i>{html.escape(t['chat_title'] or '')}, "
+        await send(bot, msg.chat.id, f"✅ {html.escape(t['text'][:500])}\n<i>{html.escape(t['chat_title'] or '')}, "
                                      f"{t['created'][5:16]}</i>", task_kb(t["id"]))
+    if len(rows) > 30:
+        await send(bot, msg.chat.id, f"Показал первые 30 из {len(rows)}. Закрой выполненные, и появятся остальные.")
 
 
 @router.callback_query(F.data.startswith("task:"))
@@ -396,7 +403,9 @@ def set_busy(owner, args, default_hours=1):
     with ab.db() as con:
         con.execute("INSERT OR REPLACE INTO busy VALUES (?,?,?,?)", (owner, iso(until), text, iso(now())))
         con.execute("DELETE FROM busy_hits WHERE owner_id=?", (owner,))
-    return (f"🔕 До {until.strftime('%H:%M')} отвечаю за тебя в личке (каждому один раз):\n"
+    till = until.astimezone(MSK)
+    till_s = till.strftime("%H:%M") if till.date() == now().astimezone(MSK).date() else till.strftime("%d.%m %H:%M")
+    return (f"🔕 До {till_s} отвечаю за тебя в личке (каждому один раз):\n"
             f"«{html.escape(text)}»\nВыключить раньше: /busy off")
 
 
@@ -536,7 +545,7 @@ async def digest_tick(bot: Bot, t=None):
         owners = [r[0] for r in con.execute("SELECT DISTINCT user_id FROM connections WHERE enabled=1")]
     for owner in owners:
         with ab.db() as con:
-            con.execute("INSERT OR IGNORE INTO assistant_settings (owner_id) VALUES (?)", (owner,))
+            con.execute("INSERT OR IGNORE INTO assistant_settings (owner_id, voice) VALUES (?, 0)", (owner,))
             s = con.execute("SELECT digest, last_digest FROM assistant_settings WHERE owner_id=?", (owner,)).fetchone()
         if not s["digest"] or s["last_digest"] == day:
             continue
@@ -596,7 +605,40 @@ def voice_card(icon, who, when, text):
     return f"{head}\n<blockquote>{html.escape(quote)}</blockquote>\n{html.escape(text)}"
 
 
-async def transcribe_file(bot: Bot, owner, file_id, size, ext, name, duration=0, who="", when="", icon="🎤 ГС"):
+CAN_REPLY_HELP = ("Чтобы текст ГС появлялся прямо в чате, разреши мне отвечать: Настройки → Telegram для бизнеса → "
+                  "Чат-боты → @mmrool_archive_bot → включи «Отвечать на сообщения». Пока прислал текст сюда.")
+
+
+async def publish_in_chat(bot: Bot, owner, target, text):
+    conn_id, chat_id, reply_id = target
+    body = "📝 " + (text or "(без слов)")
+    parts = [body[i:i + 4000] for i in range(0, len(body), 4000)]
+    for n, part in enumerate(parts):
+        for attempt in range(4):
+            try:
+                await bot.send_message(chat_id, part, business_connection_id=conn_id, parse_mode=None,
+                                       disable_web_page_preview=True,
+                                       reply_parameters=ReplyParameters(message_id=reply_id,
+                                                                        allow_sending_without_reply=True)
+                                       if n == 0 and reply_id else None)
+                break
+            except Exception as e:
+                if ab.is_network(e) and attempt < 3:
+                    await asyncio.sleep(3)
+                    continue
+                log.warning("не опубликовал текст ГС в чате: %s", e)
+                return False, str(e)
+    return True, ""
+
+
+def no_reply_right(err):
+    err = (err or "").lower()
+    return any(s in err for s in ("not enough rights", "bot_access_forbidden", "business_peer", "can't reply",
+                                  "cant_reply", "forbidden", "not allowed", "rights"))
+
+
+async def transcribe_file(bot: Bot, owner, file_id, size, ext, name, duration=0, who="", when="", icon="🎤 ГС",
+                          target=None):
     if WHISPER["broken"]:
         ab.notify(owner, "📝 Расшифровка ГС сейчас недоступна: на сервере не запустилось распознавание речи.")
         return None
@@ -620,6 +662,14 @@ async def transcribe_file(bot: Bot, owner, file_id, size, ext, name, duration=0,
         return None
     finally:
         Path(path).unlink(missing_ok=True)
+    if target:
+        ok, err = await publish_in_chat(bot, owner, target, text)
+        if ok:
+            return text
+        if no_reply_right(err):
+            ab.notify(owner, CAN_REPLY_HELP)
+        else:
+            ab.notify(owner, f"📝 Не смог показать текст в чате ({html.escape(err[:200])}), прислал сюда.")
     ab.notify(owner, voice_card(icon, who, when, text))
     return text
 
@@ -631,7 +681,7 @@ def msg_when(m: Message):
         return ""
 
 
-async def voice_to_text(bot: Bot, owner, msg: Message, force=False):
+async def voice_to_text(bot: Bot, owner, msg: Message, force=False, target=None):
     if not force and not setting(owner, "voice"):
         return None
     obj = msg.voice or msg.video_note
@@ -639,10 +689,11 @@ async def voice_to_text(bot: Bot, owner, msg: Message, force=False):
         return None
     return await transcribe_file(bot, owner, obj.file_id, obj.file_size, ".ogg" if msg.voice else ".mp4",
                                  f"stt_{msg.chat.id}_{msg.message_id}", getattr(obj, "duration", 0) or 0,
-                                 ab.person(msg.from_user), msg_when(msg), "🎤 ГС" if msg.voice else "⭕ Кружок")
+                                 ab.person(msg.from_user), msg_when(msg), "🎤 ГС" if msg.voice else "⭕ Кружок",
+                                 target=target)
 
 
-async def last_voice(bot: Bot, owner, chat_id):
+async def last_voice(bot: Bot, owner, chat_id, conn_id=None):
     with ab.db() as con:
         row = con.execute(
             "SELECT * FROM messages WHERE owner_id=? AND chat_id=? AND media_type IN ('голосовое', 'кружок')"
@@ -654,9 +705,10 @@ async def last_voice(bot: Bot, owner, chat_id):
     voice = row["media_type"] == "голосовое"
     file_id = row["store_file_id"] or row["file_id"]
     when = (row["date"] or "")[5:16].replace("-", ".")
+    target = (conn_id, chat_id, row["message_id"]) if conn_id else None
     return await transcribe_file(bot, owner, file_id, None, ".ogg" if voice else ".mp4",
                                  f"stt_{chat_id}_{row['message_id']}", 0, row["sender_name"] or "", when,
-                                 "🎤 ГС" if voice else "⭕ Кружок")
+                                 "🎤 ГС" if voice else "⭕ Кружок", target=target)
 
 
 @router.message(Command("voice"))
@@ -666,16 +718,18 @@ async def cmd_voice(msg: Message):
     arg = (msg.text or "").partition(" ")[2].strip().lower()
     if arg in ("auto", "авто", "on", "вкл"):
         set_setting(msg.from_user.id, "voice", 1)
-        await ab.answer(msg, "📝 Режим auto: каждое ГС и кружок собеседника сразу присылаю текстом.\n"
-                             "Ответ «т» на ГС тоже работает.")
+        await ab.answer(msg, "📝 Режим auto: каждое ГС и кружок собеседника сразу присылаю тебе сюда текстом.\n"
+                             "Ответ «т» на ГС в чате тоже работает: текст появится прямо в чате.")
     elif arg in ("off", "выкл"):
         set_setting(msg.from_user.id, "voice", 0)
-        await ab.answer(msg, "📝 Режим off: расшифровываю только по метке. Ответь в чате на ГС словом «т», "
-                             "метку сотру, текст пришлю сюда.")
+        await ab.answer(msg, "📝 Режим off: расшифровываю только по запросу. Ответь в чате на ГС словом «т», "
+                             "метку сотру, а текст появится в чате ответом на это ГС.")
     else:
         mode = "auto" if setting(msg.from_user.id, "voice") else "off"
-        await ab.answer(msg, f"📝 Сейчас режим {mode}.\n/voice auto: каждое ГС сразу в текст.\n"
-                             "/voice off: только по метке. Ответь на ГС словом «т», получишь текст в боте.")
+        await ab.answer(msg, f"📝 Сейчас режим {mode}.\n"
+                             "Ответь в чате на ГС словом «т»: текст появится прямо в чате ответом на ГС.\n"
+                             "/voice auto: каждое входящее ГС сразу присылаю сюда текстом.\n"
+                             "/voice off: только по «т».")
 
 
 # ---------- обещания, пересказ, поиск ----------
@@ -820,6 +874,7 @@ async def cmd_promises(msg: Message):
         await ab.answer(msg, "Напиши так: /promises @username [за месяц]")
         return
     days = period_days(args, 30)
+    await ab.answer(msg, f"⏳ Собираю договорённости с @{html.escape(who)} за {days} дн…")
     rows = await gather(msg.from_user.id, who, days=days)
     ab.notify(msg.chat.id, await promises_text(msg.from_user.id, rows, "@" + who))
 
@@ -834,6 +889,7 @@ async def cmd_summary(msg: Message):
         await ab.answer(msg, "Напиши так: /summary @username [за неделю]")
         return
     days = period_days(args, 7)
+    await ab.answer(msg, f"⏳ Пересказываю переписку с @{html.escape(who)} за {days} дн…")
     rows = await gather(msg.from_user.id, who, days=days)
     ab.notify(msg.chat.id, await summary_text(msg.from_user.id, rows, "@" + who, days))
 
@@ -961,7 +1017,8 @@ async def handle_business(msg: Message, bot: Bot, owner, mine):
         src = msg.reply_to_message
         if src and text.lower() in VOICE_TRIGGERS and (src.voice or src.video_note):
             await ab.remove_trigger(msg, bot, owner)
-            asyncio.create_task(voice_to_text(bot, owner, src, force=True))
+            asyncio.create_task(voice_to_text(bot, owner, src, force=True,
+                                              target=(msg.business_connection_id, msg.chat.id, src.message_id)))
             return True
         if msg.reply_to_message and text.lower() in TASK_TRIGGERS:
             await ab.remove_trigger(msg, bot, owner)
@@ -999,7 +1056,7 @@ async def chat_command(bot: Bot, owner, msg: Message, cmd, rest):
             rows = more if len(more) > len(rows) else rows
         ab.notify(owner, await summary_text(owner, rows, title, days))
     elif cmd in ("гс", "текст"):
-        await last_voice(bot, owner, msg.chat.id)
+        await last_voice(bot, owner, msg.chat.id, msg.business_connection_id)
     elif cmd.startswith("выгруз"):
         since, until = export_args(rest)
         asyncio.create_task(run_export(bot, owner, msg.chat.id, since, until))
@@ -1009,9 +1066,9 @@ async def chat_command(bot: Bot, owner, msg: Message, cmd, rest):
 
 HELP = (
     "Что я умею, кроме архива:\n\n"
-    "⚡ В любом чате набери @mmrool_archive_bot и выбери действие из меню: ⏰ напомнить (можно сразу "
-    "«@mmrool_archive_bot 18:00 созвон»), ✅ задача, 📥 выгрузить этот чат, 🧾 пересказ, 🤝 что обещали, "
-    "🔎 найти, 💤 занят на 2 часа. Служебное сообщение я сразу удаляю, ответ приходит сюда.\n"
+    "⚡ В любом чате набери @mmrool_archive_bot и выбери действие: 📝 расшифровать ГС, ⏰ напомнить (можно сразу "
+    "«@mmrool_archive_bot 18:00 созвон»), ✅ задача, 🔎 найти, 🧾 пересказ, 🤝 что обещали, 📥 выгрузить чат, "
+    "💤 занят. Служебное сообщение я сразу удаляю, ответ приходит сюда (текст ГС появляется в самом чате).\n"
     "⏰ /remind 18:00 созвон, напоминание. За 30 и 5 минут предупрежу, в последнюю минуту буду долбить, "
     "пока не нажмёшь «Я помню», потом лишнее сотру. /reminders список.\n"
     "💬 В любом личном чате напиши «!напомни 18:00 созвон» или «бот, напомни завтра в 9 позвонить». "
@@ -1019,8 +1076,10 @@ HELP = (
     "«!найди адрес», «!выгрузи».\n"
     "📤 /export @username [с 01.09.2026] [по 05.11.2026], выгрузка переписки в HTML и TXT. "
     "Или просто «выгрузи @username».\n"
-    "📝 Ответь на ГС или кружок словом «т», получишь текст в боте, метку сотру. "
-    "/voice auto: каждое ГС сразу в текст, /voice off: только по «т».\n"
+    "📝 Расшифровка ГС, две фишки:\n"
+    "  1) по запросу: ответь в чате на ГС или кружок словом «т» (или выбери в меню @ «Расшифровать последнее ГС»), "
+    "метку сотру, а текст появится прямо в чате ответом на ГС, его видят оба;\n"
+    "  2) /voice auto: каждое входящее ГС сразу присылаю тебе сюда текстом, в чат ничего не пишу. /voice off выключить.\n"
     "🤝 /promises @username, кто что обещал и к какому сроку.\n"
     "📋 /summary @username за неделю, пересказ переписки.\n"
     "🔎 /find где он кидал адрес, поиск по смыслу и словам с любыми окончаниями.\n"
