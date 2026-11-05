@@ -80,6 +80,59 @@ class UserClient:
         except SessionPasswordNeededError:
             return "password"
 
+    async def resolve(self, target):
+        target = str(target).strip()
+        if target.lstrip("-").isdigit():
+            uid = int(target)
+            try:
+                return await self.client.get_entity(uid)
+            except Exception:
+                async for d in self.client.iter_dialogs():
+                    if d.id == uid:
+                        return d.entity
+                raise
+        return await self.client.get_entity(target.lstrip("@") if not target.startswith("@") else target)
+
+    async def export_dialog(self, target, since=None, until=None, progress=None, image_budget=30 * 1024 * 1024):
+        from io import BytesIO
+        from PIL import Image
+        async with self.lock:
+            entity = await self.resolve(target)
+            me = await self.client.get_me()
+            messages, spent, count = [], 0, 0
+            kwargs = {"reverse": True}
+            if since:
+                kwargs["offset_date"] = since
+            async for m in self.client.iter_messages(entity, **kwargs):
+                if until and m.date > until:
+                    break
+                count += 1
+                media = media_label(m)
+                thumb = None
+                if m.photo and spent < image_budget:
+                    try:
+                        raw = await self.client.download_media(m, file=bytes)
+                        img = Image.open(BytesIO(raw)).convert("RGB")
+                        img.thumbnail((480, 480))
+                        buf = BytesIO()
+                        img.save(buf, "JPEG", quality=62)
+                        thumb = buf.getvalue()
+                        spent += len(thumb)
+                    except Exception as e:
+                        log.warning("выгрузка: фото %s не взял: %s", m.id, e)
+                sender = getattr(m.sender, "first_name", None) or getattr(m.sender, "title", None) or "Собеседник"
+                messages.append({"id": m.id, "date": m.date, "out": bool(m.out), "sender": sender,
+                                 "text": m.message or "", "media": media, "thumb": thumb,
+                                 "reply_to": m.reply_to.reply_to_msg_id if m.reply_to else None})
+                if progress and count % 500 == 0:
+                    await progress(count)
+            name = " ".join(x for x in (getattr(entity, "first_name", None), getattr(entity, "last_name", None)) if x) \
+                or getattr(entity, "title", None) or str(target)
+            if getattr(entity, "username", None):
+                name += f" (@{entity.username})"
+            owner = " ".join(x for x in (me.first_name, me.last_name) if x) or "Я"
+            return name, owner, messages
+
     async def download_post(self, private, internal, username, msg_id):
         peer = int(f"-100{internal}") if private else username
         async with self.lock:
@@ -119,3 +172,29 @@ def cleanup(files):
 
 def is_media(path):
     return Path(path).suffix.lower() in MEDIA_EXT
+
+
+def media_label(m):
+    if m.photo:
+        return "фото"
+    if getattr(m, "video_note", None):
+        return "кружок"
+    if getattr(m, "voice", None):
+        return "голосовое"
+    if getattr(m, "video", None):
+        return "видео"
+    if getattr(m, "sticker", None):
+        return "стикер"
+    if getattr(m, "gif", None):
+        return "гифка"
+    if getattr(m, "audio", None):
+        return "аудио"
+    if m.document:
+        return "файл"
+    if m.geo:
+        return "геолокация"
+    if m.contact:
+        return "контакт"
+    if m.media:
+        return "медиа"
+    return None

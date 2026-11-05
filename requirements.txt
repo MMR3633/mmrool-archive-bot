@@ -1,3 +1,7 @@
 aiogram==3.31.0
 telethon
 qrcode[pil]
+pillow
+faster-whisper
+av
+numpy

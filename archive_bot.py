@@ -110,6 +110,8 @@ def init_db():
         con.execute("UPDATE edits SET owner_id=? WHERE owner_id IS NULL", (OWNER_ID,))
         for row in con.execute("SELECT id, user_id FROM connections"):
             CONN_OWNER[row["id"]] = row["user_id"]
+    import assistant
+    assistant.init_db()
 
 
 def now():
@@ -248,6 +250,12 @@ def store_row(owner, msg: Message, quoted=False):
 async def on_message(msg: Message, bot: Bot):
     owner = await resolve_owner(bot, msg.business_connection_id)
     mine = bool(msg.from_user and msg.from_user.id == owner)
+    import assistant
+    try:
+        if await assistant.handle_business(msg, bot, owner, mine):
+            return
+    except Exception as e:
+        log.warning("помощник: %s", e)
     if mine and msg.reply_to_message and (msg.text or "").strip().lower() in SAVE_TRIGGERS:
         await remove_trigger(msg, bot, owner)
     else:
@@ -538,7 +546,8 @@ async def cmd_start(msg: Message):
                  "добавь меня, доступ ко всем личным чатам, разреши удалять сообщения.\n\n"
                  "Сохранить что-то тихо: ответь на сообщение точкой, точку я сразу уберу.\n\n"
                  "/chats листать архив прямо здесь, по чатам и дням\n/stats сколько сохранено\n"
-                 "/search слово поиск по архиву\nКнопка «Архив» открывает то же в мини-аппе.",
+                 "/search слово поиск по архиву\nКнопка «Архив» открывает то же в мини-аппе.\n\n"
+                 "/help всё, что я умею как помощник: напоминания, выгрузка переписки, ГС в текст, задачи и другое.",
                  archive_keyboard())
 
 
@@ -938,7 +947,19 @@ async def setup_menu(bot: Bot):
     for attempt in range(20):
         try:
             await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Архив", web_app=WebAppInfo(url=WEBAPP_URL)))
-            await bot.set_my_commands([BotCommand(command="chats", description="Листать архив по чатам и дням"),
+            await bot.set_my_commands([BotCommand(command="help", description="Все функции помощника"),
+                                       BotCommand(command="remind", description="Напоминание: /remind 18:00 созвон"),
+                                       BotCommand(command="reminders", description="Мои напоминания"),
+                                       BotCommand(command="tasks", description="Мои задачи"),
+                                       BotCommand(command="export", description="Выгрузить переписку: /export @username"),
+                                       BotCommand(command="summary", description="Пересказ: /summary @username"),
+                                       BotCommand(command="promises", description="Обещания: /promises @username"),
+                                       BotCommand(command="find", description="Поиск по смыслу"),
+                                       BotCommand(command="busy", description="Режим занят: /busy 2ч текст"),
+                                       BotCommand(command="birthdays", description="Дни рождения"),
+                                       BotCommand(command="digest", description="Итоги дня"),
+                                       BotCommand(command="voice", description="ГС в текст: on или off"),
+                                       BotCommand(command="chats", description="Листать архив по чатам и дням"),
                                        BotCommand(command="search", description="Поиск: /search слово"),
                                        BotCommand(command="stats", description="Сколько сохранено"),
                                        BotCommand(command="start", description="Как подключить")])
@@ -971,8 +992,11 @@ async def main():
     if WEB_PORT:
         import web
         await web.start(bot, WEB_PORT)
+    import assistant
+    assistant.init_db()
     dp = Dispatcher()
     dp.include_router(router)
+    dp.include_router(assistant.router)
     while True:
         try:
             await bot.delete_webhook(drop_pending_updates=False)
@@ -989,6 +1013,7 @@ async def main():
     asyncio.create_task(archiver(bot))
     asyncio.create_task(setup_menu(bot))
     asyncio.create_task(janitor())
+    asyncio.create_task(assistant.loops(bot))
     while True:
         try:
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
