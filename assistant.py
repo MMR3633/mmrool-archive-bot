@@ -1094,6 +1094,13 @@ async def warm_whisper():
     import stt
     try:
         await asyncio.to_thread(stt.load, str(ab.DATA / "whisper"))
+        probe = ab.DATA / "stt_probe.oga"
+        if probe.exists():
+            import time
+            t = time.time()
+            text = await asyncio.to_thread(stt.transcribe, str(probe), str(ab.DATA / "whisper"))
+            log.info("распознавание: проба %s за %.1f с: %s", probe.name, time.time() - t, text[:300])
+            probe.unlink(missing_ok=True)
     except Exception as e:
         log.warning("помощник: модель распознавания не загрузилась: %s", e)
 
