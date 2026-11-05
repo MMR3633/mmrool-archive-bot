@@ -18,8 +18,10 @@ from timeparse import MSK, fmt, parse_duration, parse_when
 log = logging.getLogger("archive.assistant")
 router = Router()
 
-CMD_RX = re.compile(r"^\s*(?:!|бот[,:]?\s+)\s*(напомни(?:ть)?|напоминание|обещания|пересказ|выгрузи|выгрузка|найди)\b(.*)$",
+CMD_RX = re.compile(r"^\s*(?:!|бот[,:]?\s+)\s*(напомни(?:ть)?|напоминание|обещания|пересказ|выгрузи|выгрузка|найди|текст|гс)\b(.*)$",
                     re.I | re.S)
+VOICE_TRIGGERS = {"т", "тт", "текст", "войс", "voice"}
+LONG_VOICE = 180
 TASK_TRIGGERS = {"+задача", "+ задача", "+з", "+ з", "+задачу", "+task"}
 SPAM_EVERY = 10
 SPAM_MAX = 20
@@ -48,7 +50,14 @@ def init_db():
         CREATE TABLE IF NOT EXISTS assistant_settings (
             owner_id INTEGER PRIMARY KEY, voice INTEGER DEFAULT 1, digest INTEGER DEFAULT 1, last_digest TEXT);
         CREATE TABLE IF NOT EXISTS pending (owner_id INTEGER PRIMARY KEY, kind TEXT, payload TEXT, created TEXT);
+        CREATE TABLE IF NOT EXISTS assistant_meta (key TEXT PRIMARY KEY, value TEXT);
         """)
+        if not con.execute("SELECT 1 FROM assistant_meta WHERE key='voice_default_v9'").fetchone():
+            owners = {ab.OWNER_ID} | {r[0] for r in con.execute("SELECT DISTINCT user_id FROM connections")}
+            for o in owners:
+                if o:
+                    con.execute("INSERT OR IGNORE INTO assistant_settings (owner_id, voice) VALUES (?, 1)", (o,))
+            con.execute("INSERT INTO assistant_meta VALUES ('voice_default_v9', '1')")
 
 
 def now():
@@ -98,7 +107,9 @@ async def drop(bot: Bot, chat_id, ids):
 def setting(owner, key):
     with ab.db() as con:
         row = con.execute(f"SELECT {key} FROM assistant_settings WHERE owner_id=?", (owner,)).fetchone()
-    return 1 if row is None else row[0]
+    if row is None:
+        return 0 if key == "voice" else 1
+    return row[0]
 
 
 def set_setting(owner, key, value):
@@ -576,13 +587,24 @@ def _transcribe(path):
     return " ".join(s.text.strip() for s in segments).strip()
 
 
-async def voice_to_text(bot: Bot, owner, msg: Message):
-    if WHISPER["broken"] or not setting(owner, "voice"):
+def voice_card(icon, who, when, text):
+    words = text.split()
+    quote = " ".join(words[:8]) + ("…" if len(words) > 8 else "")
+    head = f"📝 {icon} от <b>{html.escape(who)}</b>" + (f", {when}" if when else "")
+    if not text:
+        return f"{head}\n<i>без слов</i>"
+    return f"{head}\n<blockquote>{html.escape(quote)}</blockquote>\n{html.escape(text)}"
+
+
+async def transcribe_file(bot: Bot, owner, file_id, size, ext, name, duration=0, who="", when="", icon="🎤 ГС"):
+    if WHISPER["broken"]:
+        ab.notify(owner, "📝 Расшифровка ГС сейчас недоступна: на сервере не запустилось распознавание речи.")
         return None
-    obj = msg.voice or msg.video_note
-    path = await ab.download(bot, f"stt_{msg.chat.id}_{msg.message_id}", obj.file_id, obj.file_size,
-                             ".ogg" if msg.voice else ".mp4")
+    if duration and duration > LONG_VOICE:
+        ab.notify(owner, f"⏳ Расшифровываю {icon} от {html.escape(who)} на {round(duration / 60)} мин…")
+    path = await ab.download(bot, name, file_id, size, ext)
     if not path:
+        ab.notify(owner, f"📝 Не смог скачать {icon} от {html.escape(who)}, попробуй ещё раз через минуту.")
         return None
     try:
         async with VOICE_SEM:
@@ -590,15 +612,51 @@ async def voice_to_text(bot: Bot, owner, msg: Message):
     except ImportError as e:
         WHISPER["broken"] = True
         log.warning("распознавание недоступно: %s", e)
+        ab.notify(owner, "📝 Расшифровка ГС сейчас недоступна: на сервере не запустилось распознавание речи.")
         return None
     except Exception as e:
         log.warning("не расшифровал ГС: %s", e)
+        ab.notify(owner, f"📝 Не получилось расшифровать {icon} от {html.escape(who)}: {html.escape(str(e))}")
         return None
     finally:
         Path(path).unlink(missing_ok=True)
-    icon = "🎤 ГС" if msg.voice else "⭕ Кружок"
-    ab.notify(owner, f"📝 {icon} от <b>{html.escape(ab.person(msg.from_user))}</b>:\n{html.escape(text) or '<i>без слов</i>'}")
+    ab.notify(owner, voice_card(icon, who, when, text))
     return text
+
+
+def msg_when(m: Message):
+    try:
+        return m.date.astimezone(MSK).strftime("%d.%m %H:%M")
+    except Exception:
+        return ""
+
+
+async def voice_to_text(bot: Bot, owner, msg: Message, force=False):
+    if not force and not setting(owner, "voice"):
+        return None
+    obj = msg.voice or msg.video_note
+    if not obj:
+        return None
+    return await transcribe_file(bot, owner, obj.file_id, obj.file_size, ".ogg" if msg.voice else ".mp4",
+                                 f"stt_{msg.chat.id}_{msg.message_id}", getattr(obj, "duration", 0) or 0,
+                                 ab.person(msg.from_user), msg_when(msg), "🎤 ГС" if msg.voice else "⭕ Кружок")
+
+
+async def last_voice(bot: Bot, owner, chat_id):
+    with ab.db() as con:
+        row = con.execute(
+            "SELECT * FROM messages WHERE owner_id=? AND chat_id=? AND media_type IN ('голосовое', 'кружок')"
+            " AND (sender_id IS NULL OR sender_id<>?) ORDER BY date DESC, message_id DESC LIMIT 1",
+            (owner, chat_id, owner)).fetchone()
+    if not row:
+        ab.notify(owner, "📝 В этом чате нет ГС от собеседника, которые я успел сохранить.")
+        return None
+    voice = row["media_type"] == "голосовое"
+    file_id = row["store_file_id"] or row["file_id"]
+    when = (row["date"] or "")[5:16].replace("-", ".")
+    return await transcribe_file(bot, owner, file_id, None, ".ogg" if voice else ".mp4",
+                                 f"stt_{chat_id}_{row['message_id']}", 0, row["sender_name"] or "", when,
+                                 "🎤 ГС" if voice else "⭕ Кружок")
 
 
 @router.message(Command("voice"))
@@ -606,9 +664,18 @@ async def cmd_voice(msg: Message):
     if not is_owner(msg):
         return
     arg = (msg.text or "").partition(" ")[2].strip().lower()
-    on = 0 if arg in ("off", "выкл") else 1
-    set_setting(msg.from_user.id, "voice", on)
-    await ab.answer(msg, "Расшифровка ГС и кружков включена." if on else "Расшифровка ГС и кружков выключена.")
+    if arg in ("auto", "авто", "on", "вкл"):
+        set_setting(msg.from_user.id, "voice", 1)
+        await ab.answer(msg, "📝 Режим auto: каждое ГС и кружок собеседника сразу присылаю текстом.\n"
+                             "Ответ «т» на ГС тоже работает.")
+    elif arg in ("off", "выкл"):
+        set_setting(msg.from_user.id, "voice", 0)
+        await ab.answer(msg, "📝 Режим off: расшифровываю только по метке. Ответь в чате на ГС словом «т», "
+                             "метку сотру, текст пришлю сюда.")
+    else:
+        mode = "auto" if setting(msg.from_user.id, "voice") else "off"
+        await ab.answer(msg, f"📝 Сейчас режим {mode}.\n/voice auto: каждое ГС сразу в текст.\n"
+                             "/voice off: только по метке. Ответь на ГС словом «т», получишь текст в боте.")
 
 
 # ---------- обещания, пересказ, поиск ----------
@@ -891,6 +958,11 @@ async def handle_business(msg: Message, bot: Bot, owner, mine):
         await inline.handle_via(msg, bot, owner)
         return True
     if mine:
+        src = msg.reply_to_message
+        if src and text.lower() in VOICE_TRIGGERS and (src.voice or src.video_note):
+            await ab.remove_trigger(msg, bot, owner)
+            asyncio.create_task(voice_to_text(bot, owner, src, force=True))
+            return True
         if msg.reply_to_message and text.lower() in TASK_TRIGGERS:
             await ab.remove_trigger(msg, bot, owner)
             await add_task(bot, owner, msg.reply_to_message)
@@ -926,6 +998,8 @@ async def chat_command(bot: Bot, owner, msg: Message, cmd, rest):
             more = await rows_from_account(msg.chat.id, days)
             rows = more if len(more) > len(rows) else rows
         ab.notify(owner, await summary_text(owner, rows, title, days))
+    elif cmd in ("гс", "текст"):
+        await last_voice(bot, owner, msg.chat.id)
     elif cmd.startswith("выгруз"):
         since, until = export_args(rest)
         asyncio.create_task(run_export(bot, owner, msg.chat.id, since, until))
@@ -945,7 +1019,8 @@ HELP = (
     "«!найди адрес», «!выгрузи».\n"
     "📤 /export @username [с 01.09.2026] [по 05.11.2026], выгрузка переписки в HTML и TXT. "
     "Или просто «выгрузи @username».\n"
-    "📝 ГС и кружки расшифровываю в текст. /voice off выключить.\n"
+    "📝 Ответь на ГС или кружок словом «т», получишь текст в боте, метку сотру. "
+    "/voice auto: каждое ГС сразу в текст, /voice off: только по «т».\n"
     "🤝 /promises @username, кто что обещал и к какому сроку.\n"
     "📋 /summary @username за неделю, пересказ переписки.\n"
     "🔎 /find где он кидал адрес, поиск по смыслу и словам с любыми окончаниями.\n"
