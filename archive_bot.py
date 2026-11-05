@@ -775,7 +775,8 @@ async def relay_request(bot: Bot, user_id, link):
     return False
 
 
-@router.message(F.from_user.id == RELAY_ID, F.chat.type == "private")
+@router.message(F.from_user.id == RELAY_ID, F.chat.type == "private",
+                F.func(lambda m: ((m.caption if m.caption is not None else m.text) or "").startswith(RELAY_RES)))
 async def on_relay_result(msg: Message, bot: Bot):
     body = msg.caption if msg.caption is not None else (msg.text or "")
     head, _, rest = body.partition("\n")

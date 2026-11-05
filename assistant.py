@@ -691,6 +691,20 @@ async def last_voice(bot: Bot, owner, chat_id, conn_id=None):
                                  "🎤 ГС" if voice else "⭕ Кружок", target=target)
 
 
+@router.message(F.chat.type == "private", F.voice | F.video_note | F.audio)
+async def on_private_voice(msg: Message, bot: Bot):
+    if not is_owner(msg):
+        return
+    obj = msg.voice or msg.video_note or msg.audio
+    ext = ".mp4" if msg.video_note else ".ogg"
+    origin = getattr(msg, "forward_origin", None)
+    who = getattr(getattr(origin, "sender_user", None), "first_name", None) or getattr(origin, "sender_user_name", None)         or ("пересланное" if origin else "тебя")
+    icon = "⭕ Кружок" if msg.video_note else "🎤 ГС"
+    await transcribe_file(bot, msg.from_user.id, obj.file_id, obj.file_size, ext,
+                          f"stt_pm_{msg.chat.id}_{msg.message_id}", getattr(obj, "duration", 0) or 0,
+                          who, msg_when(msg), icon)
+
+
 @router.message(Command("voice"))
 async def cmd_voice(msg: Message):
     if not is_owner(msg):
@@ -1060,6 +1074,7 @@ HELP = (
     "  1) по запросу: ответь в чате на ГС или кружок словом «т» (или выбери в меню @ «Расшифровать последнее ГС»), "
     "метку сотру, а текст появится прямо в чате ответом на ГС, его видят оба;\n"
     "  2) /voice auto: каждое входящее ГС сразу присылаю тебе сюда текстом, в чат ничего не пишу. /voice off выключить.\n"
+    "  3) перешли мне любое ГС или кружок сюда, в личку, и я пришлю текст.\n"
     "🤝 /promises @username, кто что обещал и к какому сроку.\n"
     "📋 /summary @username за неделю, пересказ переписки.\n"
     "🔎 /find где он кидал адрес, поиск по смыслу и словам с любыми окончаниями.\n"
