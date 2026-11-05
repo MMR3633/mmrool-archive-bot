@@ -549,6 +549,8 @@ async def cmd_start(msg: Message):
                  "Подключение (нужен Telegram Premium): Настройки → Telegram для бизнеса → Чат-боты → "
                  "добавь меня, доступ ко всем личным чатам, разреши удалять сообщения.\n\n"
                  "Сохранить что-то тихо: ответь на сообщение точкой, точку я сразу уберу.\n\n"
+                 "В любом чате набери @mmrool_archive_bot и выбери действие: напомнить, задача, выгрузить чат, "
+                 "пересказ, что обещали, найти, занят. Ответ придёт сюда, собеседник ничего не увидит.\n\n"
                  "/chats листать архив прямо здесь, по чатам и дням\n/stats сколько сохранено\n"
                  "/search слово поиск по архиву\nКнопка «Архив» открывает то же в мини-аппе.\n\n"
                  "/help всё, что я умею как помощник: напоминания, выгрузка переписки, ГС в текст, задачи и другое.",
@@ -1001,6 +1003,8 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
     dp.include_router(assistant.router)
+    import inline
+    dp.include_router(inline.router)
     while True:
         try:
             await bot.delete_webhook(drop_pending_updates=False)

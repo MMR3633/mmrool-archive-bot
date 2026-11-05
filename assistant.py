@@ -308,6 +308,16 @@ async def add_task(bot: Bot, owner, src: Message):
     return tid
 
 
+async def add_task_text(bot: Bot, owner, text, chat_title=""):
+    with ab.db() as con:
+        cur = con.execute("INSERT INTO tasks (owner_id, text, who, chat_title, created) VALUES (?,?,?,?,?)",
+                          (owner, text, "", chat_title, iso(now())))
+        tid = cur.lastrowid
+    where = f" (чат с {html.escape(chat_title)})" if chat_title else ""
+    await send(bot, owner, f"📝 Задача{where}:\n{html.escape(text[:600])}", task_kb(tid))
+    return tid
+
+
 def task_kb(tid):
     return kb([("✅ Готово", f"task:done:{tid}"), ("⏰ Напомнить", f"task:rem:{tid}")])
 
@@ -364,15 +374,19 @@ async def cmd_busy(msg: Message, bot: Bot):
     if args.lower() in ("off", "выкл", "стоп"):
         await finish_busy(bot, owner)
         return
+    await ab.answer(msg, set_busy(owner, args))
+
+
+def set_busy(owner, args, default_hours=1):
     until, text = parse_duration(args) if args else (None, "")
     if until is None:
-        until, text = now() + timedelta(hours=1), args
+        until, text = now() + timedelta(hours=default_hours), args
     text = text or "Сейчас занят, отвечу чуть позже."
     with ab.db() as con:
         con.execute("INSERT OR REPLACE INTO busy VALUES (?,?,?,?)", (owner, iso(until), text, iso(now())))
         con.execute("DELETE FROM busy_hits WHERE owner_id=?", (owner,))
-    await ab.answer(msg, f"🔕 До {until.strftime('%H:%M')} отвечаю за тебя в личке (каждому один раз):\n"
-                         f"«{html.escape(text)}»\nВыключить раньше: /busy off")
+    return (f"🔕 До {until.strftime('%H:%M')} отвечаю за тебя в личке (каждому один раз):\n"
+            f"«{html.escape(text)}»\nВыключить раньше: /busy off")
 
 
 async def busy_reply(bot: Bot, owner, msg: Message):
@@ -872,6 +886,10 @@ async def on_pending_answer(msg: Message, bot: Bot):
 
 async def handle_business(msg: Message, bot: Bot, owner, mine):
     text = (msg.text or "").strip()
+    if mine and msg.via_bot and msg.via_bot.id == bot.id:
+        import inline
+        await inline.handle_via(msg, bot, owner)
+        return True
     if mine:
         if msg.reply_to_message and text.lower() in TASK_TRIGGERS:
             await ab.remove_trigger(msg, bot, owner)
@@ -917,6 +935,9 @@ async def chat_command(bot: Bot, owner, msg: Message, cmd, rest):
 
 HELP = (
     "Что я умею, кроме архива:\n\n"
+    "⚡ В любом чате набери @mmrool_archive_bot и выбери действие из меню: ⏰ напомнить (можно сразу "
+    "«@mmrool_archive_bot 18:00 созвон»), ✅ задача, 📥 выгрузить этот чат, 🧾 пересказ, 🤝 что обещали, "
+    "🔎 найти, 💤 занят на 2 часа. Служебное сообщение я сразу удаляю, ответ приходит сюда.\n"
     "⏰ /remind 18:00 созвон, напоминание. За 30 и 5 минут предупрежу, в последнюю минуту буду долбить, "
     "пока не нажмёшь «Я помню», потом лишнее сотру. /reminders список.\n"
     "💬 В любом личном чате напиши «!напомни 18:00 созвон» или «бот, напомни завтра в 9 позвонить». "
