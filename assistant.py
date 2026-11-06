@@ -389,7 +389,14 @@ async def cmd_busy(msg: Message, bot: Bot):
         return
     owner = msg.from_user.id
     args = (msg.text or "").partition(" ")[2].strip()
-    if args.lower() in ("off", "выкл", "стоп"):
+    low = args.lower()
+    off_words = ("off", "выкл", "выключи", "выключить", "откл", "отключи", "стоп",
+                 "хватит", "отмена", "убери", "сними", "нет", "0", "все", "всё")
+    busy_now = False
+    with ab.db() as con:
+        b = con.execute("SELECT until FROM busy WHERE owner_id=?", (owner,)).fetchone()
+        busy_now = bool(b and parse_iso(b["until"]) > now())
+    if any(low.startswith(w) for w in off_words) or (not args and busy_now):
         await finish_busy(bot, owner)
         return
     await ab.answer(msg, set_busy(owner, args))
