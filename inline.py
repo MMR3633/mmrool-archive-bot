@@ -129,7 +129,10 @@ async def run_action(bot: Bot, owner, key, rest, chat_msg=None):
             return
         await assistant.add_task_text(bot, owner, rest, title)
     elif key == "занят":
-        await assistant.send(bot, owner, assistant.set_busy(owner, rest or "2ч", default_hours=2))
+        if assistant.is_busy_off(rest):
+            await assistant.finish_busy(bot, owner)
+        else:
+            await assistant.send(bot, owner, assistant.set_busy(owner, rest or "2ч", default_hours=2))
     elif chat_msg is None:
         await assistant.send(bot, owner, "Это действие работает в личных чатах, где подключён бот "
                                          "(Настройки → Telegram для бизнеса → Чат-боты).")

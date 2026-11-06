@@ -18,8 +18,31 @@ from timeparse import MSK, fmt, parse_duration, parse_when
 log = logging.getLogger("archive.assistant")
 router = Router()
 
-CMD_RX = re.compile(r"^\s*(?:!|бот[,:]?\s+)\s*(напомни(?:ть)?|напоминание|обещания|пересказ|выгрузи|выгрузка|найди|текст|гс)\b(.*)$",
+CMD_RX = re.compile(r"^\s*(?:!|бот[,:]?\s+)\s*(напомни(?:ть)?|напоминание|обещания|пересказ|выгрузи|выгрузка|найди|текст|гс|занят)\b(.*)$",
                     re.I | re.S)
+BUSY_OFF_RX = re.compile(r"^\s*(off|выкл\w*|откл\w*|стоп\w*|хватит|отмен\w*|убер\w*|сним\w*|нет|0|всё|все)\b", re.I)
+BUSY_OFF_TEXT_RX = re.compile(
+    r"(?i)^\s*(?:бот[,:]?\s*)?(?:(?:выключ|отключ|убер|сним|отмен|останов|стоп|хватит)\w*\s+(?:режим\s+)?(?:«|\")?(?:занят|автоответ)\w*"
+    r"|(?:режим\s+)?(?:«|\")?(?:занят|автоответ)\w*(?:»|\")?\s+(?:off|выкл\w*|откл\w*|стоп|убер\w*|сним\w*))\b.{0,40}$")
+
+
+def is_busy_off(text):
+    return bool(BUSY_OFF_RX.match(text or ""))
+
+
+def busy_active(owner):
+    with ab.db() as con:
+        b = con.execute("SELECT until FROM busy WHERE owner_id=?", (owner,)).fetchone()
+    return bool(b) and parse_iso(b["until"]) > now()
+
+
+def is_busy_off_message(msg):
+    text = (msg.text or "").strip()
+    if not text or text.startswith("/"):
+        return False
+    if BUSY_OFF_TEXT_RX.match(text):
+        return True
+    return len(text.split()) <= 3 and is_busy_off(text) and busy_active(msg.from_user.id)
 VOICE_TRIGGERS = {"т", "тт", "текст", "войс", "voice"}
 LONG_VOICE = 180
 TASK_TRIGGERS = {"+задача", "+ задача", "+з", "+ з", "+задачу", "+task"}
@@ -389,17 +412,17 @@ async def cmd_busy(msg: Message, bot: Bot):
         return
     owner = msg.from_user.id
     args = (msg.text or "").partition(" ")[2].strip()
-    low = args.lower()
-    off_words = ("off", "выкл", "выключи", "выключить", "откл", "отключи", "стоп",
-                 "хватит", "отмена", "убери", "сними", "нет", "0", "все", "всё")
-    busy_now = False
-    with ab.db() as con:
-        b = con.execute("SELECT until FROM busy WHERE owner_id=?", (owner,)).fetchone()
-        busy_now = bool(b and parse_iso(b["until"]) > now())
-    if any(low.startswith(w) for w in off_words) or (not args and busy_now):
+    if is_busy_off(args) or (not args and busy_active(owner)):
         await finish_busy(bot, owner)
         return
     await ab.answer(msg, set_busy(owner, args))
+
+
+@router.message(F.chat.type == "private", F.text, F.func(lambda m: is_owner(m) and is_busy_off_message(m)))
+async def text_busy_off(msg: Message, bot: Bot):
+    if not is_owner(msg):
+        return
+    await finish_busy(bot, msg.from_user.id)
 
 
 def set_busy(owner, args, default_hours=1):
@@ -413,7 +436,7 @@ def set_busy(owner, args, default_hours=1):
     till = until.astimezone(MSK)
     till_s = till.strftime("%H:%M") if till.date() == now().astimezone(MSK).date() else till.strftime("%d.%m %H:%M")
     return (f"🔕 До {till_s} отвечаю за тебя в личке (каждому один раз):\n"
-            f"«{html.escape(text)}»\nВыключить раньше: /busy off")
+            f"«{html.escape(text)}»\nВыключить раньше: /busy off или напиши мне «выключи занят»")
 
 
 async def busy_reply(bot: Bot, owner, msg: Message):
@@ -1063,6 +1086,11 @@ async def chat_command(bot: Bot, owner, msg: Message, cmd, rest):
         asyncio.create_task(run_export(bot, owner, msg.chat.id, since, until))
     elif cmd == "найди":
         ab.notify(owner, await find_text(owner, rest, [msg.chat.id]))
+    elif cmd == "занят":
+        if is_busy_off(rest):
+            await finish_busy(bot, owner)
+        else:
+            await send(bot, owner, set_busy(owner, rest or "2ч", default_hours=2))
 
 
 HELP = (
