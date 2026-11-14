@@ -63,7 +63,9 @@ INTENTS = [
     ("remind", r"\bнапомн|^таймер\b"),
     ("deleted", r"удал[её]н|удалил|удалили|стёр|стер\b|стерли|стёрли"),
     ("images", r"\b(скинь|покажи|найди|дай|пришли|отправь|го|хочу|нужн\w*|можно)\b.{0,40}\b(картинк\w*|фото|мем\w*|гифк\w*|обои|арт\w*|"
-               r"пикч\w*|изображени\w*)\b|^(картинк\w*|фото|мем\w*|обои|пикч\w*)\b|\b(мем|мемы|мемов)\b|покажи,? как выгляд"),
+               r"пикч\w*|изображени\w*)\b|^(картинк\w*|фото|мем\w*|обои|пикч\w*)\b|\b(мем|мемы|мемов)\b|покажи,? как выгляд|"
+               r"^(скинь|кинь|пришли|покажи|отправь)\s+(?!.*(кидал|скидывал|присылал|писал|адрес|номер|ссылк|файл|голосов|гс\b|"
+               r"документ|удал|расписан|план|заметк|задач|напомин))[а-яёa-z-]+(\s+[а-яёa-z-]+){0,2}\s*[!.]*$"),
     ("look", r"^(а |ну )?(как|какой|какая|какие) (выгляд\w*|на вид)|^(а |ну )?как (он|она|оно|они) выгляд"),
     ("shop", r"\b(где|как) (купить|заказать|взять|достать)\b|\bкупить\b|\bпочём\b|\bпочем\b"),
     ("schedule", r"расписан|\bпланы?\b|по делам|какие (у меня )?дела|мои дела|что (у меня )?(на|по) (сегодня|завтра|недел)|"
@@ -747,6 +749,7 @@ LABELS = {"schedule": "📅 Мои планы", "find": "🔎 Найти в пе
           "summary": "🧾 Кратко о чате", "deleted": "🗑 Удалённое", "images": "📷 Картинка", "chat": "💬 Поболтать",
           "help": "❓ Что умею", "first": "🗓 Когда познакомились", "fun": "🎲 Рандом", "note": "📝 Заметки", "stats": "📊 Статистика чата", "remind": "⏰ Напомнить", "voice": "🎤 Расшифровать ГС", "photo": "📷 Что на фото",
           "look": "🖼 Как выглядит", "shop": "🛒 Где купить", "product": "🔎 Найти товар по фото"}
+ASKY = re.compile(r"(?i)(^|\s)(курс|погод\w*|сколько|кто|что|где|когда|как|почему|зачем|какой|какая|какие|который|время|час|почём|почем|цена|стоит|переведи|посчитай|\d)")
 MENU_TEXT = "⟪hi⟫ Чем помочь? Нажми кнопку, допиши запрос и отправь:"
 INLINE_MODE = re.compile(r"(?i)^(к|pic|картинки|картинка|фото|\?|и)\s+")
 
@@ -850,9 +853,10 @@ async def brain(ctx: Ctx) -> Answer:
     log.info("угу: %s от %s: %s", kind, ctx.owner, ctx.question[:80])
     if kind == "help":
         return Answer(public=HELP.replace("👻", "⟪hi⟫", 1))
-    ok, tier, cap = tiers.use(ctx.owner, "ask")
-    if not ok:
-        return Answer(public=tiers.limit_text("ask", tier, cap))
+    if kind not in tiers.FREE_KINDS:
+        ok, tier, cap = tiers.use(ctx.owner, "ask")
+        if not ok:
+            return Answer(public=tiers.limit_text("ask", tier, cap))
     if kind in ("remind", "note"):
         key = "plans" if kind == "remind" else "notes"
         ok, tier, cap = tiers.room(ctx.owner, key)
@@ -905,26 +909,16 @@ async def brain(ctx: Ctx) -> Answer:
         q, found = await pick_images(ctx.question, ctx.owner, ctx.chat_id)
         return Answer(public=f"⟪photo⟫ {html.escape(q)}" if found else "⟪sad⟫ Картинок не нашёл.", images=found)
     if kind == "look":
-        ok, tier, cap = tiers.use(ctx.owner, "web")
-        return Answer(public=await look_answer(ctx) if ok else tiers.limit_text("web", tier, cap))
+        return Answer(public=await look_answer(ctx))
     if kind == "shop":
         return Answer(public=shop_answer(ctx))
     if kind == "web":
         remember_topic(ctx.owner, ctx.chat_id, subject_of(ctx.question))
-        return Answer(public=await counted_web(ctx))
-    return Answer(public=await counted_web(ctx, strict=not llm.enabled()))
+        return Answer(public=await web_answer(ctx.question))
+    return Answer(public=await web_answer(ctx.question, strict=not llm.enabled()))
 
 
-async def counted_web(ctx, strict=False):
-    """Точные ответы (курс, погода, калькулятор) без лимита, поиск в интернете по лимиту тарифа."""
-    import instant
-    exact = await instant.answer(ctx.question)
-    if exact:
-        return "⟪web⟫ " + exact
-    ok, tier, cap = tiers.use(ctx.owner, "web")
-    if not ok:
-        return tiers.limit_text("web", tier, cap)
-    return await web_answer(ctx.question, strict)
+
 
 
 async def look_answer(ctx):
@@ -1215,14 +1209,16 @@ async def on_inline(query: InlineQuery, bot: Bot):
         text = text[mode.end():].strip()
     image_mode = bool(mode) and mode.group(1) not in ("?", "и")
     offset = int(query.offset) if (query.offset or "").isdigit() else 0
-    if not image_mode and len(text) >= 3 and not offset:
+    if mode and not image_mode and len(text) >= 3 and not offset:
         exact = await instant.answer(text)
         if exact:
             plain = re.sub(r"<[^>]+>", "", exact)
             await query.answer([article(deco("⟪web⟫ ", False) + exact, f"🌐 {plain[:60]}", plain[60:180] or None)],
                                cache_time=60, is_personal=False)
             return
-    want_web = (mode and mode.group(1) in ("?", "и")) or (not mode and intent(text) in ("web", "look"))
+    # без префикса вопросы не подсказываем: человек жмёт «Отправить», и Угу отвечает в чате сам (как Мира),
+    # а на его ответ можно ответить реплаем. Готовая подсказка ушла бы от имени человека.
+    want_web = bool(mode) and mode.group(1) in ("?", "и")
     if want_web and len(text) >= 3:
         res = await websearch.lookup(text)
         if not res:
@@ -1233,7 +1229,9 @@ async def on_inline(query: InlineQuery, bot: Bot):
         await query.answer([article(deco("⟪web⟫ ", False) + body, f"🌐 {title}", res["text"][:120] or None)],
                            cache_time=120, is_personal=False)
         return
-    if len(text) < 2 or (not mode and intent(text) not in ("unknown", "images")):
+    kind = intent(text) if not mode else "images"
+    asks = kind == "unknown" and (len(text.split()) > 3 or ASKY.search(slang.normalize(text)))
+    if len(text) < 2 or kind not in ("unknown", "images") or asks:
         await query.answer([], cache_time=5, is_personal=True)
         return
     found = await websearch.images(image_query(text) or text, 30, offset)

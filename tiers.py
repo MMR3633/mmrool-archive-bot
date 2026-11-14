@@ -23,10 +23,10 @@ REF_TRIAL_DAYS = 7
 REF_BONUS_DAYS = 7
 LEVELS = [(10, "pro", "Pro навсегда"), (50, "ultra", "Ultra навсегда")]
 
-# None = безлимит (с честным потолком FAIR в сутки для дневных)
+# None = безлимит (с честным потолком FAIR в сутки для дневных). Картинки и поиск в интернете бесплатно всем.
+FREE_KINDS = {"help", "chat", "images", "look", "shop", "web", "unknown"}
 DAILY = {
     "ask": {"free": 30, "lite": 150, "pro": None, "ultra": None},
-    "web": {"free": 10, "lite": 50, "pro": None, "ultra": None},
     "photo": {"free": 5, "lite": 30, "pro": None, "ultra": None},
     "fx": {"free": 5, "lite": 30, "pro": None, "ultra": None},
     "posts": {"free": 3, "lite": 20, "pro": 100, "ultra": None},
@@ -35,7 +35,7 @@ TOTAL = {
     "plans": {"free": 5, "lite": 30, "pro": 200, "ultra": None},
     "notes": {"free": 20, "lite": 200, "pro": 2000, "ultra": None},
 }
-LABELS = {"ask": "Запросы к Угу", "web": "Ответы из интернета", "photo": "Что на фото", "fx": "Фото-эффекты",
+LABELS = {"ask": "Запросы к Угу", "photo": "Что на фото", "fx": "Фото-эффекты",
           "posts": "Посты из каналов",
           "plans": "Напоминания и задачи", "notes": "Заметки"}
 AFTER_PAY = {
@@ -197,7 +197,7 @@ def limit_text(key, tier, cap):
 def limits_view(uid):
     tier = tier_of(uid)
     out = []
-    for key in ("ask", "web", "photo", "fx", "posts"):
+    for key in ("ask", "photo", "fx", "posts"):
         out.append({"key": key, "name": LABELS[key], "used": used(uid, key), "max": DAILY[key][tier]})
     for key in ("plans", "notes"):
         out.append({"key": key, "name": LABELS[key], "used": count_total(uid, key), "max": TOTAL[key][tier]})

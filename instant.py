@@ -154,27 +154,78 @@ async def geocode(name):
     return best[1] if best else None
 
 
-async def weather(question):
-    m = WEATHER.search(question.strip())
-    if not m:
+WHEN = [(re.compile(r"(?i)\bна\s+(эту\s+|всю\s+)?недел\w*|\bна\s+7\s+дн\w*"), "week"),
+        (re.compile(r"(?i)\bна\s+выходн\w*"), "weekend"),
+        (re.compile(r"(?i)\bна\s+(\d)\s+(дн\w*|сут\w*)"), "days"),
+        (re.compile(r"(?i)\bпослезавтра\b"), "after"),
+        (re.compile(r"(?i)\bзавтра\b"), "tomorrow"),
+        (re.compile(r"(?i)\b(сейчас|сегодня|щас)\b"), "now")]
+WEATHER_WORD = re.compile(r"(?i)\bпогод\w*")
+FILLER = re.compile(r"(?i)\b(какая|какой|какую|как|там|будет|скажи|подскажи|покажи|а|ну|прогноз\w*|пожалуйста|плз|в|во|на|для|по|у)\b")
+WD = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
+def weather_parts(question):
+    """«погода в москве на неделю», «дятьково погода», «какая погода завтра в питере» → (срок, город, дней)."""
+    q = question.strip(" ?!.,")
+    if not WEATHER_WORD.search(q):
         return None
-    when = (m.group(1) or m.group(3) or "сейчас").lower()
-    place = await geocode(m.group(2))
+    when, days = "now", 0
+    for rx, kind in WHEN:
+        m = rx.search(q)
+        if m:
+            when = when if when != "now" else kind
+            if kind == "days":
+                days = int(m.group(1))
+            q = rx.sub(" ", q)
+    city = re.sub(r"\s+", " ", FILLER.sub(" ", WEATHER_WORD.sub(" ", q))).strip(" ,-")
+    if len(city) > 40 or len(city.split()) > 3:
+        return None
+    return when, city or "Москва", days
+
+
+async def weather(question):
+    parts = weather_parts(question)
+    if not parts:
+        return None
+    when, city, days = parts
+    place = await geocode(city)
     if not place:
-        return f"Не нашёл город «{m.group(2).strip()}»."
+        return f"Не нашёл город «{city}». Напиши, например: «погода в Казани на неделю»."
     lat, lon, name, country = place
     status, body = await websearch.http_get("https://api.open-meteo.com/v1/forecast", {
-        "latitude": lat, "longitude": lon, "timezone": "auto", "forecast_days": 3,
+        "latitude": lat, "longitude": lon, "timezone": "auto", "forecast_days": 7,
         "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
-        "daily": "temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"})
+        "daily": "time,temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"})
     try:
         d = json.loads(body)
-    except ValueError:
-        return None
-    if when == "завтра":
         day = d["daily"]
-        return (f"{name} завтра: <b>{round(day['temperature_2m_min'][1])}…{round(day['temperature_2m_max'][1])}°</b>, "
-                f"{CODES.get(day['weather_code'][1], '')}, осадки {day['precipitation_probability_max'][1]}%")
+    except (ValueError, KeyError, TypeError):
+        return None
+
+    def line(i, label):
+        rain = day["precipitation_probability_max"][i]
+        return (f"{label}: <b>{round(day['temperature_2m_min'][i])}…{round(day['temperature_2m_max'][i])}°</b>, "
+                f"{CODES.get(day['weather_code'][i], '')}" + (f", осадки {rain}%" if rain else ""))
+
+    n = len(day["temperature_2m_max"])
+    if when in ("tomorrow", "after") and n > 1:
+        i = 1 if when == "tomorrow" else min(2, n - 1)
+        return f"{name} " + line(i, "завтра" if i == 1 else "послезавтра")
+    if when in ("week", "weekend", "days"):
+        dates = day.get("time") or []
+        idx = list(range(min(n, days or 7)))
+        if when == "weekend" and dates:
+            idx = [i for i in range(n) if datetime.fromisoformat(dates[i]).weekday() >= 5] or idx
+        labels = []
+        for i in idx:
+            if dates:
+                dt = datetime.fromisoformat(dates[i])
+                labels.append(f"{WD[dt.weekday()]} {dt:%d.%m}")
+            else:
+                labels.append(["сегодня", "завтра", "послезавтра"][i] if i < 3 else f"+{i} дн")
+        head = {"week": "на неделю", "weekend": "на выходные", "days": f"на {len(idx)} дн."}[when]
+        return f"{name}, погода {head}:\n" + "\n".join(line(i, labels[k]) for k, i in enumerate(idx))
     c = d["current"]
     return (f"{name} сейчас: <b>{round(c['temperature_2m'])}°</b> (ощущается {round(c['apparent_temperature'])}°), "
             f"{CODES.get(c['weather_code'], '')}, ветер {round(c['wind_speed_10m'] / 3.6, 1)} м/с")

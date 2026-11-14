@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import html
 import logging
 import os
@@ -167,10 +168,17 @@ def handles(bot, owner):
     return len(BOTS) < 2 or bot_name(bot) == business_bot(owner)
 
 
+ASKED = contextvars.ContextVar("asked", default=None)
+
+
 def via_for(user_id):
-    """Каким ботом писать человеку: тот, к которому подключён архив, иначе тот, кому он писал последним."""
+    """Каким ботом писать человеку: на его сообщение отвечает тот бот, которому он написал;
+    фоновые письма идут от бота, к которому подключён архив, иначе от того, кому он писал последним."""
     if len(BOTS) < 2 or not user_id:
         return "archive"
+    asked = ASKED.get()
+    if asked and asked[0] == user_id:
+        return asked[1]
     with db() as con:
         conn = con.execute("SELECT COALESCE(b.bot,'archive') b FROM connections c LEFT JOIN conn_bot b ON b.id=c.id"
                            " WHERE c.user_id=? AND c.enabled=1 ORDER BY (COALESCE(b.bot,'archive')='ugu') DESC, c.updated DESC"
@@ -1213,7 +1221,13 @@ def build_dispatcher():
                 seen_user(user, data.get("bot"))
             except Exception as e:
                 log.warning("bot_users: %s", e)
-        return await handler(event, data)
+        business = event.business_message or event.edited_business_message or event.deleted_business_messages             or event.business_connection
+        token = ASKED.set((user, bot_name(data["bot"]))) if user and not business and data.get("bot") else None
+        try:
+            return await handler(event, data)
+        finally:
+            if token:
+                ASKED.reset(token)
 
     dp.include_router(tiers.router)
     dp.include_router(ugu.start_router)
