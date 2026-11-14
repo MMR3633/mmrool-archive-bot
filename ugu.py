@@ -352,8 +352,16 @@ def image_query(question):
 
 # ---------- мозг ----------
 
-async def web_answer(question):
+def on_topic(question, res):
+    want = set(stems(websearch.keywords(websearch.clean_query(question))))
+    have = set(stems(" ".join([res["text"], res["source"][0] if res["source"] else ""] + [t for t, _ in res["links"]])))
+    return bool(want & have)
+
+
+async def web_answer(question, strict=False):
     res = await websearch.lookup(question)
+    if strict and (not res or not on_topic(question, res)):
+        return "⟪huh⟫ Не понял. Спроси по-другому или «угубот, что умеешь?»."
     if llm.enabled() and res:
         context = (res["text"] + "\n" + "\n".join(f"{t}: {u}" for t, u in res["links"])).strip()
         better = await llm.ask(f"Вопрос: {question}\nНайдено в интернете:\n{context}\n\nОтветь коротко, 1-3 предложения, "
@@ -393,9 +401,9 @@ async def brain(ctx: Ctx) -> Answer:
         q = image_query(ctx.question)
         found = await websearch.images(q, 4)
         return Answer(public=f"⟪photo⟫ {html.escape(q)}" if found else "⟪sad⟫ Картинок не нашёл.", images=found)
-    if kind == "web" or (kind == "unknown" and llm.enabled()):
+    if kind == "web":
         return Answer(public=await web_answer(ctx.question))
-    return Answer(private="⟪huh⟫ Не понял вопрос. Спроси «угубот, что умеешь?».")
+    return Answer(public=await web_answer(ctx.question, strict=not llm.enabled()))
 
 
 def ab_bot():
