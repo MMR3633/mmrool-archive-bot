@@ -3,6 +3,7 @@ import hashlib
 import html
 import json
 import logging
+import random
 import re
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -17,6 +18,7 @@ from aiogram.types import (InlineQuery, InlineQueryResultArticle, InlineQueryRes
 
 import archive_bot as ab
 import llm
+import slang
 import websearch
 from textutil import match_score, promises, stems, summary
 from timeparse import MSK
@@ -25,8 +27,10 @@ log = logging.getLogger("archive.ugu")
 router = Router()
 UGU = {"bot": None, "username": "ugu_ai", "guest": None}
 
-NAME_ANY = re.compile(r"(?i)(?<![\w@])(?:угу\s*-?\s*бот\w*|угубот\w*|@ugu_ai)(?!\w)[\s,:!.\-]*")
+NAME_ANY = re.compile(r"(?i)(?<![\w@])(?:угу\s*-?\s*бот\w*|угубот\w*)(?!\w)[\s,:!.\-]*")
 NAME_LEAD = re.compile(r"(?i)^\s*угу\s*[,:!]\s*(.+)$", re.S)
+MENTION = re.compile(r"(?i)@ugu_ai(_bot)?\b[\s,:!.\-]*")
+CALL_MAX = 300
 THINK = "⟪think⟫ …"
 EMO = {"ghost": "👻", "think": "💭", "ok": "✅", "find": "🔎", "calendar": "📅", "alarm": "⏰", "mail": "📩", "huh": "❓",
        "web": "🌐", "trash": "🗑", "photo": "📷", "hi": "👋", "love": "❤️", "sleep": "💤", "voice": "🎤", "boo": "😜",
@@ -39,14 +43,19 @@ NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
 INTENTS = [
-    ("help", r"^(привет\w*|здаров\w*|хай|ты кто|кто ты|что (ты )?умеешь|помощь|help|команды)\b"),
+    ("help", r"^(что (ты )?(умеешь|можешь)|помощь|help|команды|как (тобой|с тобой) пользоваться)\b"),
+    ("chat", r"^(привет\w*|здравствуй\w*|добр\w+ (утро|день|вечер|ночи)|как (твои |у тебя )?дела|как ты\b|как сам|как жизнь|"
+             r"что делаешь|чем занят|ты (тут|здесь|живой|кто)|кто ты|спасибо|благодар|молодец|красава|умница|"
+             r"люблю тебя|ты лучший|ты (дурак|тупой|глупый)|тупой бот|пока\b|спокойной ночи|доброй ночи)"),
     ("remind", r"\bнапомн"),
     ("deleted", r"удал[её]н|удалил|удалили|стёр|стер\b|стерли|стёрли"),
-    ("schedule", r"расписан|\bпланы?\b|\bдела\b|что (у меня )?(на|по) (сегодня|завтра|недел)|напоминани|\bзадач"),
+    ("images", r"\b(скинь|покажи|найди|дай|пришли|отправь|го|хочу|нужн\w*|можно)\b.{0,40}\b(картинк\w*|фото|мем\w*|гифк\w*|обои|арт\w*|"
+               r"пикч\w*|изображени\w*)\b|^(картинк\w*|фото|мем\w*|обои|пикч\w*)\b|\b(мем|мемы|мемов)\b|как выгляд"),
+    ("schedule", r"расписан|\bпланы?\b|по делам|какие (у меня )?дела|мои дела|что (у меня )?(на|по) (сегодня|завтра|недел)|"
+                 r"что у меня (сегодня|завтра|на недел)|я (сегодня|завтра) свобод|напоминани|\bзадач"),
     ("promises", r"обещ|договорил|договорён|договорен"),
     ("summary", r"сводк|пересказ|перескажи|о ч[её]м (мы )?(говорили|болтали|речь|переписк)|что было|кратко|итог"),
     ("voice", r"расшифр|что (он |она )?(сказал|говорит) в (гс|голосов)|текст (гс|голосов)"),
-    ("images", r"^(картинк\w*|фотк\w*|покажи (фото|картинк|как выгляд)\w*)\b|^(фото|пик|pic)\s"),
     ("photo", r"что (на|тут на|это на) (фото|картинк|скрин)|прочитай|что (тут|здесь) написано|что (это|тут) такое\??$"),
     ("find", r"^(найди|поищи|где|когда)\b.*\b(он|она|ты|я|мы|скидывал\w*|кидал\w*|писал\w*|присылал\w*|говорил\w*|"
              r"отправлял\w*|адрес\w*|ссылк\w*|номер\w*|телефон\w*)\b|в (этой )?(переписке|чате)"),
@@ -58,7 +67,10 @@ EXPLICIT = {"remind", "deleted", "schedule", "images", "summary", "promises", "f
 STRONG = {"help", "remind", "deleted", "schedule", "promises", "summary", "voice", "images", "photo", "find"}
 FIND_WORDS = re.compile(r"(?i)\b(найди|поищи|где|когда|он|она|ты|я|мы|мне|в (этой )?(переписке|чате)|скидывал\w*|кидал\w*|"
                         r"писал\w*|присылал\w*|говорил\w*|отправлял\w*)\b")
-IMAGE_WORDS = re.compile(r"(?i)^(картинк\w*|фотк\w*|покажи|фото|пик|pic)\s+((фото|картинк\w*|как выгляд\w*)\s+)?")
+IMAGE_WORDS = re.compile(r"(?i)\b(скинь|покажи|найди|дай|пришли|отправь|го|хочу|нужн\w*|можно|мне|нам|сюда|в чат|"
+                         r"пожалуйста|как(ой|ую|ие|ое)[ -]?(нибудь|то)|любую|любой|любые|рандомн\w*|случайн\w*|"
+                         r"картинк\w*|фото|пикч\w*|изображени\w*|гифк\w*|с|про|на тему|как выгляд\w*)\b")
+PLURAL_IMG = re.compile(r"(?i)\b(картинки|картинок|мемы|мемов|фото\s+\w+ов|обои|несколько|пару|штук)\b")
 
 HELP = ("👻 Я Угу, призрак твоих переписок: вижу всё, даже удалённое. Зови по имени:\n"
         "• в своей переписке: «угубот, что у меня на неделе?», ответ впишу прямо в твоё сообщение;\n"
@@ -109,7 +121,7 @@ def notify(chat_id, text):
 
 
 def intent(question, reply=None):
-    q = (question or "").strip()
+    q = slang.normalize(question or "").strip()
     if reply is not None:
         explicit = any(rx.search(q) for name, rx in INTENTS if name in EXPLICIT)
         if not explicit and (reply.photo or (reply.document and (reply.document.mime_type or "").startswith("image/"))):
@@ -127,6 +139,8 @@ def intent(question, reply=None):
 def find_call(text):
     """(часть до имени, вопрос) если в сообщении позвали Угу, иначе None."""
     t = text or ""
+    if len(t) > CALL_MAX:
+        return None
     m = NAME_ANY.search(t)
     if m:
         before, after = t[:m.start()].rstrip(" ,:;-"), t[m.end():].strip()
@@ -138,7 +152,7 @@ def find_call(text):
             return "", before
         return "", ""
     m = NAME_LEAD.match(t)
-    if m and intent(m.group(1)) in STRONG:
+    if m and intent(m.group(1)) in STRONG | {"chat"}:
         return "", m.group(1).strip()
     return None
 
@@ -347,7 +361,51 @@ async def voice_answer(ctx):
 
 
 def image_query(question):
-    return IMAGE_WORDS.sub("", question or "").strip(" ?!.,") or question
+    q = re.sub(r"\s+", " ", IMAGE_WORDS.sub(" ", slang.normalize(question or ""))).strip(" ?!.,")
+    return q or "мем"
+
+
+CHAT = [
+    (r"^(привет|здравствуй|добр)", ["⟪hi⟫ Привет! Я тут. Спроси что-нибудь или «что умеешь».", "⟪hi⟫ Хей! Парю рядом, зови.",
+                                    "⟪boo⟫ Бу! Шучу, привет."]),
+    (r"как (твои |у тебя )?дела|как ты\b|как сам|как жизнь", ["⟪ghost⟫ Норм, летаю по твоим перепискам, всё под контролем.",
+                                                            "⟪see⟫ Отлично. Никто ничего не удалял. Пока что.",
+                                                            "⟪lol⟫ Как у призрака: ни забот, ни тела."]),
+    (r"что делаешь|чем занят", ["⟪see⟫ Смотрю, кто что удалил.", "⟪sleep⟫ Парю между сообщениями.",
+                                "⟪think⟫ Перебираю твои напоминания."]),
+    (r"ты (тут|здесь|живой)", ["⟪wow⟫ Тут! Призраки не спят.", "⟪ghost⟫ Всегда тут."]),
+    (r"кто ты|ты кто", ["⟪ghost⟫ Я Угу, призрак твоих переписок. Помню всё, даже удалённое. Спроси «что умеешь»."]),
+    (r"спасибо|благодар", ["⟪love⟫ Обращайся.", "⟪ok⟫ Угу.", "⟪love⟫ Всегда пожалуйста."]),
+    (r"молодец|красава|умница|ты лучший|люблю тебя", ["⟪love⟫ Ой, я покраснел. Насколько призрак может.", "⟪lol⟫ Знаю."]),
+    (r"дурак|тупой|глупый", ["⟪sad⟫ Учусь. Напиши, как надо было ответить, запомню.", "⟪sad⟫ Обидно, но справедливо. Я ещё учусь."]),
+    (r"пока|спокойной ночи|доброй ночи", ["⟪sleep⟫ Спокойной! Я посторожу переписки.", "⟪hi⟫ Пока! Зови, если что."]),
+]
+
+
+def chat_reply(question):
+    q = slang.normalize(question).lower()
+    for rx, answers in CHAT:
+        if re.search(rx, q):
+            return random.choice(answers)
+    return random.choice(CHAT[0][1])
+
+
+def log_question(owner, question, kind, source):
+    try:
+        with ab.db() as con:
+            con.execute("CREATE TABLE IF NOT EXISTS ugu_log (owner_id INTEGER, ts TEXT, source TEXT, question TEXT, "
+                        "normalized TEXT, intent TEXT)")
+            con.execute("INSERT INTO ugu_log VALUES (?,?,?,?,?,?)", (owner, now().strftime("%Y-%m-%d %H:%M:%S"), source,
+                                                                     question[:500], slang.normalize(question)[:500], kind))
+    except Exception as e:
+        log.warning("угу: журнал вопросов: %s", e)
+
+
+async def pick_images(question):
+    q = image_query(question)
+    found = (await websearch.images(q, 30))[:30]
+    random.shuffle(found)
+    return q, found[:4 if PLURAL_IMG.search(slang.normalize(question)) else 1]
 
 
 # ---------- мозг ----------
@@ -373,10 +431,14 @@ async def web_answer(question, strict=False):
 
 async def brain(ctx: Ctx) -> Answer:
     kind = intent(ctx.question, ctx.reply)
+    log_question(ctx.owner, ctx.question, kind, "chat" if ctx.chat_id else "direct")
+    ctx.question = slang.normalize(ctx.question)
     in_chat = has_chat(ctx.owner, ctx.chat_id)
     log.info("угу: %s от %s: %s", kind, ctx.owner, ctx.question[:80])
     if kind == "help":
         return Answer(public=HELP.replace("👻", "⟪hi⟫", 1))
+    if kind == "chat":
+        return Answer(public=chat_reply(ctx.question))
     if kind == "schedule":
         return Answer(public=schedule_text(ctx.owner, ctx.question))
     if kind == "remind":
@@ -398,8 +460,7 @@ async def brain(ctx: Ctx) -> Answer:
     if kind == "photo":
         return Answer(public=await photo_answer(ctx))
     if kind == "images":
-        q = image_query(ctx.question)
-        found = await websearch.images(q, 4)
+        q, found = await pick_images(ctx.question)
         return Answer(public=f"⟪photo⟫ {html.escape(q)}" if found else "⟪sad⟫ Картинок не нашёл.", images=found)
     if kind == "web":
         return Answer(public=await web_answer(ctx.question))
@@ -510,7 +571,7 @@ async def answer_by_name(msg: Message, bot: Bot, owner, prefix, question):
 # ---------- @ugu_ai: гостевой режим, inline-картинки, личка ----------
 
 def strip_name(text):
-    return NAME_ANY.sub(" ", text or "").strip()
+    return NAME_ANY.sub(" ", MENTION.sub(" ", text or "")).strip()
 
 
 def article(text):
@@ -537,7 +598,8 @@ async def on_guest(msg: Message, bot: Bot):
         return
     kind = intent(question, msg.reply_to_message)
     if kind == "images":
-        found = await websearch.images(image_query(question), 1)
+        log_question(caller, question, kind, "guest")
+        q, found = await pick_images(question)
         if found:
             await bot.answer_guest_query(msg.guest_query_id, photo_results(found)[0])
             return
