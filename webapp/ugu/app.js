@@ -508,7 +508,7 @@ PS.week = mondayOf(new Date());
 VIEWS.plans = {
   async load(quiet) {
     const el = $('#v-plans');
-    if (!$('#pBody', el)) render(el, `<div id="pBusy"></div><div class="card rise" id="pWeek"></div><div id="pBody" class="stack" style="margin-top:16px"></div><button class="fab" data-act="add" aria-label="Добавить">${IC.plus}</button>`);
+    if (!$('#pBody', el)) render(el, `<div id="pBusy"></div><div class="card rise" id="pWeek"></div><div id="pBody" class="stack" style="margin-top:16px;padding-bottom:80px"></div><button class="fab" data-act="add" aria-label="Добавить">${IC.plus}</button>`);
     this.drawWeek();
     const box = $('#pBody');
     if (!quiet) render(box, skCard(3));
@@ -563,7 +563,7 @@ const NS = { q: '', items: [] };
 VIEWS.notes = {
   async load() {
     const el = $('#v-notes');
-    if (!$('#nBody', el)) render(el, `<div class="search rise">${IC.search}<input class="inp" id="nQ" data-input="notes" placeholder="Поиск по заметкам" autocomplete="off" aria-label="Поиск по заметкам"></div><div id="nBody" style="margin-top:16px"></div><button class="fab" data-act="note-new" aria-label="Новая заметка">${IC.plus}</button>`);
+    if (!$('#nBody', el)) render(el, `<div class="search rise">${IC.search}<input class="inp" id="nQ" data-input="notes" placeholder="Поиск по заметкам" autocomplete="off" aria-label="Поиск по заметкам"></div><div id="nBody" style="margin-top:16px;padding-bottom:80px"></div><button class="fab" data-act="note-new" aria-label="Новая заметка">${IC.plus}</button>`);
     const box = $('#nBody');
     render(box, `<div class="masonry">${[90, 130, 110, 80, 120, 100].map(h => `<div class="sk" style="height:${h}px;margin-bottom:12px;border-radius:18px"></div>`).join('')}</div>`);
     try {
