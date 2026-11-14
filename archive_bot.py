@@ -31,6 +31,7 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 STORE_CHAT_ID = int(os.environ.get("STORE_CHAT_ID", "0"))
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
 WEB_PORT = int(os.environ.get("PORT") or os.environ.get("WEB_PORT") or "0")
+TG_PROXY = os.environ.get("TG_PROXY", "")
 MAX_DOWNLOAD = 20 * 1024 * 1024
 MSK = timezone(timedelta(hours=3))
 
@@ -1143,12 +1144,42 @@ async def janitor():
         await asyncio.sleep(300)
 
 
+def tg_session():
+    """С ноутбука Bot API доступен только через прокси (TG_PROXY), на сервере напрямую."""
+    if not TG_PROXY:
+        return None
+    from aiogram.client.session.aiohttp import AiohttpSession
+    return AiohttpSession(proxy=TG_PROXY)
+
+
+@router.message(Command("backup"), F.func(lambda m: m.from_user and m.from_user.id == OWNER_ID and m.chat.type == "private"))
+async def cmd_backup(msg: Message, bot: Bot):
+    """Копия базы владельцу: для переезда на другой сервер. Только хозяину бота."""
+    import gzip
+    TMP.mkdir(parents=True, exist_ok=True)
+    snap, packed = TMP / "backup.db", TMP / f"archive_{now()[:10]}.db.gz"
+    src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(snap)
+    try:
+        src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+    with open(snap, "rb") as f, gzip.open(packed, "wb", 6) as g:
+        g.write(f.read())
+    snap.unlink(missing_ok=True)
+    try:
+        await bot.send_document(msg.chat.id, FSInputFile(packed), caption=f"База архива, {packed.stat().st_size // 1024} КБ",
+                                parse_mode=None)
+    finally:
+        packed.unlink(missing_ok=True)
+
+
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if not BOT_TOKEN or not STORE_CHAT_ID:
         raise SystemExit("нет BOT_TOKEN или STORE_CHAT_ID в .env")
     init_db()
-    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(BOT_TOKEN, session=tg_session(), default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     bots = [bot]
     for b in bots:
         while True:
@@ -1162,7 +1193,7 @@ async def main():
     BOTS["archive"] = bot
     ugu_bot = None
     if UGU_TOKEN:
-        ugu_bot = Bot(UGU_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        ugu_bot = Bot(UGU_TOKEN, session=tg_session(), default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         while True:
             try:
                 await ugu_bot.delete_webhook(drop_pending_updates=False)
