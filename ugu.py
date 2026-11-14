@@ -479,6 +479,10 @@ def on_topic(question, res):
 
 
 async def web_answer(question, strict=False):
+    import instant
+    exact = await instant.answer(question)
+    if exact:
+        return "⟪web⟫ " + exact
     res = await websearch.lookup(question)
     if strict and (not res or not on_topic(question, res)):
         return "⟪huh⟫ Не понял. Спроси по-другому или «угубот, что умеешь?»."
@@ -532,6 +536,8 @@ async def sem_start():
         clf = semantic.Classifier(examples, str(ab.DATA / "semantic"))
         await asyncio.to_thread(clf.ready)
         SEM["clf"] = clf
+        model_dir = str(ab.DATA / "semantic")
+        websearch.RANKER = lambda q, texts: [float(x) for x in (semantic.embed(texts, model_dir) @ semantic.embed([q], model_dir)[0])]
         log.info("угу: понимание по смыслу готово, примеров %s", len(clf.texts))
     except Exception as e:
         SEM["broken"] = True
@@ -891,9 +897,19 @@ async def on_inline(query: InlineQuery, bot: Bot):
                             article(deco(HELP, False), "❓ Что умею", "Все команды и как звать")],
                            cache_time=300, is_personal=False)
         return
+    import instant
     mode = INLINE_MODE.match(text)
     if mode:
         text = text[mode.end():].strip()
+    image_mode = bool(mode) and mode.group(1) not in ("?", "и")
+    offset = int(query.offset) if (query.offset or "").isdigit() else 0
+    if not image_mode and len(text) >= 3 and not offset:
+        exact = await instant.answer(text)
+        if exact:
+            plain = re.sub(r"<[^>]+>", "", exact)
+            await query.answer([article(deco("⟪web⟫ ", False) + exact, f"🌐 {plain[:60]}", plain[60:180] or None)],
+                               cache_time=60, is_personal=False)
+            return
     want_web = (mode and mode.group(1) in ("?", "и")) or (not mode and intent(text) in ("web", "look"))
     if want_web and len(text) >= 3:
         res = await websearch.lookup(text)
@@ -908,8 +924,9 @@ async def on_inline(query: InlineQuery, bot: Bot):
     if len(text) < 2 or (not mode and intent(text) not in ("unknown", "images")):
         await query.answer([], cache_time=5, is_personal=True)
         return
-    found = await websearch.images(image_query(text) or text, 20)
-    await query.answer(photo_results(found), cache_time=300, is_personal=False)
+    found = await websearch.images(image_query(text) or text, 30, offset)
+    await query.answer(photo_results(found), cache_time=300, is_personal=False,
+                       next_offset=str(offset + 30) if found else "")
 
 
 @router.callback_query(F.data == "ugh")

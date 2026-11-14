@@ -79,7 +79,7 @@ def wiki_url(title):
 
 def sentences(text):
     out = []
-    for para in (text or "").split("\n"):
+    for para in (text or "").replace("́", "").split("\n"):
         para = re.sub(r"\s*\([^()]{0,80}\)", "", para).strip()
         if len(para) < 30 or para.startswith("=="):
             continue
@@ -188,30 +188,82 @@ async def bing_links(query, n):
 HOW = re.compile(r"(?i)^(почему|зачем|отчего|как|каким образом)\b")
 
 
+ADS = re.compile(r"(?i)в каталоге|ознакомиться с ценами|купить по|скидк|доставк|отзыв\w* покупател|интернет-магазин|"
+                 r"узнайте|подробнее на|читайте|смотрите|статистика игроков|прогнозы и ставки|кнопками и без")
+RANKER = None  # fn(question, [тексты]) -> [сходство 0..1]; ставит ugu, когда модель смыслов загружена
+
+
+def snippet_sentences(snippet):
+    s = re.sub(r"\s*…\s*$|\s*\.\.\.\s*$", "", (snippet or "").replace("́", "")).strip()
+    parts = [p.strip() for p in SENTENCE.split(s) if len(p.strip()) >= 25]
+    return parts or ([s] if len(s) >= 25 else [])
+
+
+def overlap(query, text):
+    want = set(stems(keywords(query)))
+    return len(want & set(stems(text))) / max(len(want), 1) if want else 0.0
+
+
+async def rank(query, cands):
+    """cands: [(текст, источник, бонус)] → [(оценка, текст, источник)] по убыванию."""
+    texts = [c[0] for c in cands]
+    sims = None
+    if RANKER is not None and texts:
+        try:
+            sims = await asyncio.to_thread(RANKER, query, texts)
+        except Exception as e:
+            log.warning("ранжирование по смыслу: %s", e)
+    out = []
+    for i, (text, src, bonus) in enumerate(cands):
+        ov = overlap(query, text)
+        score = (sims[i] if sims is not None else 0.5) + 0.25 * ov + bonus
+        if ov == 0:
+            score -= 0.3
+        if text.rstrip().endswith("?") or len(text) < 45:
+            score -= 0.25
+        if ADS.search(text):
+            score -= 0.3
+        if re.search(r"\d", query) is None and re.search(r"(?i)^(сколько|когда|какой год|в каком году)", query) and re.search(r"\d", text):
+            score += 0.05
+        out.append((score, text, src))
+    return sorted(out, key=lambda x: -x[0])
+
+
 async def lookup(question):
-    """Ответ из интернета: {'text': 1-2 предложения, 'source': (title, url) | None, 'links': [(title, url)]}."""
+    """Ответ из интернета: {'text': 1-2 предложения, 'source': (title, url) | None, 'links': [(title, url)]}.
+    Кандидаты: выжимки поисковика + предложения Википедии; лучший выбирается по смыслу вопроса."""
     query = clean_query(question)
     if not query:
         return None
     m = DEFINE.match(query)
     subject = m.group(1) if m else keywords(query) or query
-    titles, found = await asyncio.gather(wiki_titles(subject), web_links(m.group(1) if m else query))
+    titles_kw, titles_q, found = await asyncio.gather(wiki_titles(subject, 2), wiki_titles(query, 2),
+                                                      web_links(m.group(1) if m else query, 6))
+    titles = list(dict.fromkeys(titles_kw + titles_q))[:3]
+    bodies = await asyncio.gather(*(wiki_text(t) for t in titles))
+    cands = []
+    for title, body in zip(titles, bodies):
+        sents = sentences(body)[:60]
+        for i, s in enumerate(sents):
+            bonus = (0.35 if m and i < 2 else 0.0) + (0.04 if i < 3 else 0.0)
+            cands.append((s, (title, wiki_url(title)), bonus))
+    for title, url, snippet in found:
+        for s in snippet_sentences(snippet):
+            cands.append((s, (title, url), 0.03 if HOW.match(query) else 0.0))
+    if not cands and not found:
+        return None
     text, source = "", None
-    first = next((x for x in found if len(x[2]) >= 60), None)
-    if HOW.match(query) and first:
-        text, source = first[2], (first[0], first[1])
-    else:
-        for title in titles[:2]:
-            body = await wiki_text(title)
-            best = sentences(body)[:2] if m else best_sentences(query, body, title)
-            if best:
-                text, source = " ".join(best), (title, wiki_url(title))
-                break
-        if not text and first:
-            text, source = first[2], (first[0], first[1])
+    if cands:
+        ranked = await rank(query, cands)
+        score, text, source = ranked[0]
+        nxt = next((t for sc, t, src in ranked[1:4] if src == source and t != text and sc > score - 0.06), None)
+        if nxt and len(text) + len(nxt) <= 420:
+            text = f"{text} {nxt}"
     links = [(t, u) for t, u, _ in found if not source or u != source[1]]
     if source and "wikipedia.org" in source[1]:
         links = [x for x in links if "wikipedia.org" not in x[1]]
+    elif titles:
+        links = [(titles[0], wiki_url(titles[0]))] + links
     if not text and not links:
         return None
     return {"text": text[:600], "source": source, "links": links[:2]}
@@ -230,13 +282,25 @@ def format_answer(res):
     return "\n".join(lines)
 
 
-async def images(query, n=20):
-    """Картинки: [(url, thumb, w, h, title)]. DuckDuckGo, запасной путь Wikimedia Commons."""
-    for source in (bing_images, ddg_images, commons_images):
+async def images(query, n=20, offset=0):
+    """Картинки: [(url, thumb, w, h, title)], url всегда JPEG (Telegram других не берёт). offset = листание."""
+    for step in range(3):
+        found = await bing_images(query, n, offset + step * 30)
+        if found:
+            return found
+    if offset:
+        return []
+    for source in (ddg_images, commons_images):
         found = await source(query, n)
         if found:
             return found
     return []
+
+
+def bing_big(turl, size=1000):
+    """Копия картинки у Bing в JPEG нужного размера: работает для любого исходного формата."""
+    base = turl.split("&")[0]
+    return f"{base}&w={size}&h={size}&c=7&rs=1&qlt=90"
 
 
 async def ddg_images(query, n):
@@ -263,20 +327,30 @@ async def ddg_images(query, n):
     return out
 
 
-async def bing_images(query, n):
-    status, body = await http_get("https://www.bing.com/images/async", {"q": query, "first": 0, "count": n * 2,
-                                                                         "setlang": "ru", "adlt": "strict"})
+PAGES = ["", " фото", " hd", " красивые", " картинки", " арт", " обои", " реальные фото", " крупно", " эстетика", " милые",
+         " смешные", " 4k", " иллюстрация", " вблизи"]
+
+
+async def bing_images(query, n, offset=0):
+    """Bing не листает выдачу на этом адресе, поэтому «следующая страница» = тот же запрос с уточнением."""
+    page = offset // 30
+    if page >= len(PAGES):
+        return []
+    status, body = await http_get("https://www.bing.com/images/async", {"q": query + PAGES[page], "first": 0,
+                                                                         "count": max(n, 35), "setlang": "ru", "adlt": "strict"})
     if status != 200:
         return []
-    out = []
+    out, seen = [], set()
     for raw in re.findall(r'class="iusc"[^>]*m="([^"]+)"', body):
         try:
             m = json.loads(html.unescape(raw))
         except ValueError:
             continue
-        url, thumb = m.get("murl", ""), m.get("turl", "")
-        if url.startswith("https://") and thumb.startswith("http") and re.search(r"\.(jpe?g)(\?|$)", url, re.I):
-            out.append((url, thumb, 0, 0, m.get("t", "")))
+        turl, murl = m.get("turl", ""), m.get("murl", "")
+        if not turl.startswith("http") or "th?id=" not in turl or turl.split("&")[0] in seen:
+            continue
+        seen.add(turl.split("&")[0])
+        out.append((bing_big(turl), bing_big(turl, 320), 0, 0, m.get("t", "") or murl))
         if len(out) >= n:
             break
     return out
