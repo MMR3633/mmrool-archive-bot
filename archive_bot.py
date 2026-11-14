@@ -875,6 +875,7 @@ USER = None
 RELAY_ID = 8887932504
 RELAY_REQ = "POSTREQ"
 RELAY_RES = "POSTRES"
+RELAY_VIA = {}
 
 
 async def relay_request(bot: Bot, user_id, link):
@@ -900,13 +901,16 @@ async def on_relay_result(msg: Message, bot: Bot):
     if len(parts) < 2 or parts[0] != RELAY_RES or not parts[1].lstrip("-").isdigit():
         return
     user_id = int(parts[1])
+    target = bot_by(RELAY_VIA.get(user_id) or "archive", bot)
     for attempt in range(5):
         try:
             if msg.text is not None:
-                await bot.send_message(user_id, rest or "(пост без текста)", parse_mode=None,
-                                       disable_web_page_preview=True)
-            else:
+                await target.send_message(user_id, rest or "(пост без текста)", parse_mode=None,
+                                          disable_web_page_preview=True)
+            elif target is bot:
                 await bot.copy_message(user_id, msg.chat.id, msg.message_id, caption=rest or None, parse_mode=None)
+            else:
+                await reupload(bot, target, user_id, msg, rest or None)
             return
         except Exception as e:
             if not is_network(e):
@@ -915,6 +919,25 @@ async def on_relay_result(msg: Message, bot: Bot):
             await asyncio.sleep(3)
 
 
+
+
+async def reupload(src: Bot, dst: Bot, chat_id, msg: Message, caption):
+    """Файл пришёл архив-боту, а человек ждёт его от Угу: скачать и отправить заново (у ботов разные file_id)."""
+    obj, send, ext = ((msg.photo[-1], dst.send_photo, ".jpg") if msg.photo else
+                      (msg.video, dst.send_video, ".mp4") if msg.video else
+                      (msg.animation, dst.send_animation, ".mp4") if msg.animation else
+                      (msg.audio, dst.send_audio, ".mp3") if msg.audio else
+                      (msg.voice, dst.send_voice, ".ogg") if msg.voice else
+                      (msg.document, dst.send_document, Path(getattr(msg.document, "file_name", "") or "").suffix))
+    if obj is None:
+        return
+    TMP.mkdir(parents=True, exist_ok=True)
+    path = TMP / f"relay_{chat_id}_{msg.message_id}{ext or ''}"
+    try:
+        await src.download(obj.file_id, destination=path)
+        await send(chat_id, FSInputFile(path), caption=caption, parse_mode=None)
+    finally:
+        path.unlink(missing_ok=True)
 
 
 async def send_post(bot: Bot, chat_id, name, text, files, too_big):
@@ -1024,9 +1047,14 @@ async def cmd_pass(msg: Message, bot: Bot):
 @router.message(F.chat.type == "private", F.text.regexp(POST_LINK))
 async def on_post_link(msg: Message, bot: Bot):
     from userclient import cleanup
+    import tiers
     for private, internal, username, mid in POST_LINK.findall(msg.text or ""):
         source = int(f"-100{internal}") if private else f"@{username}"
         name = f"c/{internal}/{mid}" if private else f"{username}/{mid}"
+        ok, tier, cap = tiers.use(msg.from_user.id, "posts")
+        if not ok:
+            await answer(msg, tiers.limit_text("posts", tier, cap).replace("⟪sad⟫", "😔"))
+            return
         try:
             n = await copy_post(bot, msg.chat.id, source, int(mid), None if private else username)
             log.info("пост %s скопирован напрямую, сообщений %s", name, n)
@@ -1035,7 +1063,8 @@ async def on_post_link(msg: Message, bot: Bot):
             log.info("пост %s напрямую не взять: %s", name, e)
         if msg.from_user.id != OWNER_ID or not await USER.ready():
             link = f"https://t.me/{'c/' + internal if private else username}/{mid}"
-            if await relay_request(bot, msg.chat.id, link):
+            RELAY_VIA[msg.chat.id] = bot_name(bot)
+            if await relay_request(bot_by("archive", bot), msg.chat.id, link):
                 await answer(msg, "Качаю пост, пришлю через минуту.")
             else:
                 await answer(msg, "Сейчас нет связи с Telegram, пришли ссылку ещё раз через минуту.")

@@ -29,12 +29,14 @@ DAILY = {
     "web": {"free": 10, "lite": 50, "pro": None, "ultra": None},
     "photo": {"free": 5, "lite": 30, "pro": None, "ultra": None},
     "fx": {"free": 5, "lite": 30, "pro": None, "ultra": None},
+    "posts": {"free": 3, "lite": 20, "pro": 100, "ultra": None},
 }
 TOTAL = {
     "plans": {"free": 5, "lite": 30, "pro": 200, "ultra": None},
     "notes": {"free": 20, "lite": 200, "pro": 2000, "ultra": None},
 }
 LABELS = {"ask": "Запросы к Угу", "web": "Ответы из интернета", "photo": "Что на фото", "fx": "Фото-эффекты",
+          "posts": "Посты из каналов",
           "plans": "Напоминания и задачи", "notes": "Заметки"}
 AFTER_PAY = {
     "lite": "Попробуй: «угубот, что у меня на неделе».",
@@ -184,7 +186,7 @@ def room(uid, key):
 
 def limit_text(key, tier, cap):
     what = LABELS.get(key, "лимит").lower()
-    nxt = "Lite" if tier == "free" else "Pro"
+    nxt = NAMES[ORDER[min(ORDER.index(tier) + 1, len(ORDER) - 1)]]
     if key in TOTAL:
         return (f"⟪sad⟫ На тарифе {NAMES[tier]} {what}: не больше {cap}. Удали лишнее или перейди на {nxt}: "
                 f"кнопка «Угу» внизу → тариф.")
@@ -195,7 +197,7 @@ def limit_text(key, tier, cap):
 def limits_view(uid):
     tier = tier_of(uid)
     out = []
-    for key in ("ask", "web", "photo", "fx"):
+    for key in ("ask", "web", "photo", "fx", "posts"):
         out.append({"key": key, "name": LABELS[key], "used": used(uid, key), "max": DAILY[key][tier]})
     for key in ("plans", "notes"):
         out.append({"key": key, "name": LABELS[key], "used": count_total(uid, key), "max": TOTAL[key][tier]})
