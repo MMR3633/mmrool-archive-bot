@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import hashlib
 import html
 import json
@@ -8,6 +9,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -50,7 +52,9 @@ INTENTS = [
     ("remind", r"\bнапомн"),
     ("deleted", r"удал[её]н|удалил|удалили|стёр|стер\b|стерли|стёрли"),
     ("images", r"\b(скинь|покажи|найди|дай|пришли|отправь|го|хочу|нужн\w*|можно)\b.{0,40}\b(картинк\w*|фото|мем\w*|гифк\w*|обои|арт\w*|"
-               r"пикч\w*|изображени\w*)\b|^(картинк\w*|фото|мем\w*|обои|пикч\w*)\b|\b(мем|мемы|мемов)\b|как выгляд"),
+               r"пикч\w*|изображени\w*)\b|^(картинк\w*|фото|мем\w*|обои|пикч\w*)\b|\b(мем|мемы|мемов)\b|покажи,? как выгляд"),
+    ("look", r"^(а |ну )?(как|какой|какая|какие) (выгляд\w*|на вид)|^(а |ну )?как (он|она|оно|они) выгляд"),
+    ("shop", r"\b(где|как) (купить|заказать|взять|достать)\b|\bкупить\b|\bпочём\b|\bпочем\b"),
     ("schedule", r"расписан|\bпланы?\b|по делам|какие (у меня )?дела|мои дела|что (у меня )?(на|по) (сегодня|завтра|недел)|"
                  r"что у меня (сегодня|завтра|на недел)|я (сегодня|завтра) свобод|напоминани|\bзадач"),
     ("promises", r"обещ|договорил|договорён|договорен|уговор|условил"),
@@ -109,8 +113,28 @@ def deco(text, custom=True):
     return EMO_RX.sub(sub, text or "")
 
 
+PREVIEW = contextvars.ContextVar("preview", default=None)
+IMG_RX = re.compile(r"⟪img:([^⟫]+)⟫")
+
+
+def lp():
+    return PREVIEW.get() or NO_PREVIEW
+
+
+def with_image(url, text):
+    """Картинка крупно над текстом: невидимая ссылка + превью."""
+    return f"⟪img:{url}⟫" + text if url else text
+
+
 async def say(call, text):
-    """Шлёт со своими эмодзи; если Telegram их не принял, повторяет с обычными."""
+    """Шлёт со своими эмодзи; если Telegram их не принял, повторяет с обычными. ⟪img:url⟫ = картинка превью."""
+    m = IMG_RX.search(text or "")
+    if m:
+        url = m.group(1)
+        PREVIEW.set(LinkPreviewOptions(url=url, prefer_large_media=True, show_above_text=True))
+        text = f'<a href="{html.escape(url, quote=True)}">⁠</a>' + IMG_RX.sub("", text)
+    else:
+        PREVIEW.set(None)
     try:
         return await call(deco(text))
     except Exception as e:
@@ -128,7 +152,10 @@ def intent(question, reply=None):
     q = slang.normalize(question or "").strip()
     if reply is not None:
         explicit = any(rx.search(q) for name, rx in INTENTS if name in EXPLICIT)
-        if not explicit and (reply.photo or (reply.document and (reply.document.mime_type or "").startswith("image/"))):
+        is_image = reply.photo or (reply.document and (reply.document.mime_type or "").startswith("image/"))
+        if is_image and PRODUCT_RX.search(q):
+            return "product"
+        if not explicit and is_image:
             return "photo"
         if not explicit and (reply.voice or reply.video_note):
             return "voice"
@@ -364,9 +391,39 @@ async def voice_answer(ctx):
         path.unlink(missing_ok=True)
 
 
+PRODUCT_RX = re.compile(r"(?i)найди (это|этот|эту|такой|такую|такие|похож\w*)|где (купить|взять|заказать|найти)|"
+                        r"сколько (стоит|стоят)|что (это|за) (товар|вещь|модель|марка|бренд|штука)|по фото|похож\w*|"
+                        r"распознай|умная камера|что это за|откуда это|какая (это )?модель|чей бренд")
+SHOP_WORDS = re.compile(r"(?i)\b(где|как|купить|заказать|взять|достать|почём|почем|подешевле|недорого|можно|мне|бы)\b")
+PRONOUN_ONLY = re.compile(r"(?i)^(его|её|ее|их|это|этого|эту|её фото|его фото|ещё|еще|другую|другой|ещё одну|еще одну)?$")
+TOPIC = {}
+TOPIC_TTL = 1800
+
+
+def remember_topic(owner, chat_id, topic):
+    topic = (topic or "").strip()
+    if topic:
+        TOPIC[(owner, chat_id or 0)] = (topic, now())
+
+
+def last_topic(owner, chat_id):
+    t = TOPIC.get((owner, chat_id or 0))
+    return t[0] if t and (now() - t[1]).total_seconds() < TOPIC_TTL else ""
+
+
+def subject_of(question):
+    """«как выглядит персик» → «персик»; «что такое фотосинтез» → «фотосинтез»."""
+    q = slang.normalize(question or "")
+    q = re.sub(r"(?i)^(а |ну )?((как|какой|какая|какие) (выгляд\w*|на вид)|как (он|она|оно|они) выгляд\w*)\s*", "", q)
+    q = websearch.clean_query(q)
+    m = websearch.DEFINE.match(q)
+    return (m.group(1) if m else websearch.keywords(q) or q).strip(" ?!.,")
+
+
 def image_query(question):
     q = re.sub(r"\s+", " ", IMAGE_WORDS.sub(" ", slang.normalize(question or ""))).strip(" ?!.,")
-    return q or "мем"
+    q = re.sub(r"(?i)^((а|ну|и|давай|ладно|окей|ок)\s+)+|\s+(а|ну)$", "", q + " ").strip()
+    return "" if PRONOUN_ONLY.match(q) or q.lower() in ("а", "ну", "и", "давай") else q
 
 
 CHAT = [
@@ -405,8 +462,9 @@ def log_question(owner, question, kind, source):
         log.warning("угу: журнал вопросов: %s", e)
 
 
-async def pick_images(question):
-    q = image_query(question)
+async def pick_images(question, owner=0, chat_id=None):
+    q = image_query(question) or last_topic(owner, chat_id) or "мем"
+    remember_topic(owner, chat_id, q if q != "мем" else "")
     found = (await websearch.images(q, 30))[:30]
     random.shuffle(found)
     return q, found[:4 if PLURAL_IMG.search(slang.normalize(question)) else 1]
@@ -439,7 +497,17 @@ SEM = {"clf": None, "broken": False}
 CONVO = {"chat", "help"}
 LABELS = {"schedule": "📅 Мои планы", "find": "🔎 Найти в переписке", "web": "🌐 Интернет", "promises": "🤝 Договорённости",
           "summary": "🧾 Кратко о чате", "deleted": "🗑 Удалённое", "images": "📷 Картинка", "chat": "💬 Поболтать",
-          "help": "❓ Что умею", "remind": "⏰ Напомнить", "voice": "🎤 Расшифровать ГС", "photo": "📷 Что на фото"}
+          "help": "❓ Что умею", "remind": "⏰ Напомнить", "voice": "🎤 Расшифровать ГС", "photo": "📷 Что на фото",
+          "look": "🖼 Как выглядит", "shop": "🛒 Где купить", "product": "🔎 Найти товар по фото"}
+MENU_TEXT = "⟪hi⟫ Чем помочь? Нажми кнопку, допиши запрос и отправь:"
+INLINE_MODE = re.compile(r"(?i)^(к|pic|картинки|картинка|фото|\?|и)\s+")
+
+
+def menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🖼 Картинки", switch_inline_query_current_chat="к ")],
+        [InlineKeyboardButton(text="🌐 Интернет", switch_inline_query_current_chat="? ")],
+        [InlineKeyboardButton(text="❓ Что умею", callback_data="ugh")]])
 
 
 def table(con):
@@ -554,12 +622,103 @@ async def brain(ctx: Ctx) -> Answer:
         return Answer(public=await voice_answer(ctx))
     if kind == "photo":
         return Answer(public=await photo_answer(ctx))
+    if kind == "product":
+        return Answer(public=await product_answer(ctx))
     if kind == "images":
-        q, found = await pick_images(ctx.question)
+        q, found = await pick_images(ctx.question, ctx.owner, ctx.chat_id)
         return Answer(public=f"⟪photo⟫ {html.escape(q)}" if found else "⟪sad⟫ Картинок не нашёл.", images=found)
+    if kind == "look":
+        return Answer(public=await look_answer(ctx))
+    if kind == "shop":
+        return Answer(public=shop_answer(ctx))
     if kind == "web":
+        remember_topic(ctx.owner, ctx.chat_id, subject_of(ctx.question))
         return Answer(public=await web_answer(ctx.question))
     return Answer(public=await web_answer(ctx.question, strict=not llm.enabled()))
+
+
+async def look_answer(ctx):
+    """«как выглядит персик»: картинка крупно над коротким описанием, тема запоминается для «а скинь ещё»."""
+    subject = subject_of(ctx.question) or last_topic(ctx.owner, ctx.chat_id)
+    if not subject:
+        return "⟪huh⟫ Как выглядит что? Например: «как выглядит персик»."
+    remember_topic(ctx.owner, ctx.chat_id, subject)
+    res, imgs = await asyncio.gather(websearch.lookup(subject), websearch.images(subject, 8))
+    text = websearch.format_answer(res) if res else ""
+    img = random.choice(imgs[:4])[0] if imgs else ""
+    body = f"⟪photo⟫ <b>{html.escape(subject)}</b>\n{text}" if text else f"⟪photo⟫ {html.escape(subject)}"
+    return with_image(img, body)
+
+
+def shop_links(query):
+    q = quote_plus(query)
+    return (f'🛒 <a href="https://market.yandex.ru/search?text={q}">Маркет</a> · '
+            f'<a href="https://www.ozon.ru/search/?text={q}">Ozon</a> · '
+            f'<a href="https://www.wildberries.ru/catalog/0/search.aspx?search={q}">WB</a> · '
+            f'<a href="https://www.avito.ru/rossiya?q={q}">Авито</a>')
+
+
+def shop_answer(ctx):
+    q = re.sub(r"\s+", " ", SHOP_WORDS.sub(" ", ctx.question)).strip(" ?!.,") or last_topic(ctx.owner, ctx.chat_id)
+    if not q:
+        return "⟪huh⟫ Что найти? Например: «где купить airpods»."
+    remember_topic(ctx.owner, ctx.chat_id, q)
+    return f"⟪find⟫ <b>{html.escape(q)}</b>\n{shop_links(q)}"
+
+
+def publish_photo(path):
+    """Кладёт фото по случайной ссылке на час, чтобы Яндекс/Google могли искать по нему. Без адреса мини-аппа = None."""
+    base = (ab.WEBAPP_URL or "").rstrip("/")
+    if not base:
+        return None
+    folder = ab.DATA / "pub"
+    folder.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha256(f"{path}{now()}{random.random()}".encode()).hexdigest()[:32] + ".jpg"
+    import shutil
+    shutil.copyfile(path, folder / name)
+    try:
+        asyncio.get_running_loop().call_later(3600, lambda: (folder / name).unlink(missing_ok=True))
+    except RuntimeError:
+        pass
+    return f"{base}/pub/{name}"
+
+
+def product_query(res):
+    words = [w for w in re.findall(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9\-]{2,}", res.get("text") or "")][:4]
+    labels = res.get("labels") or []
+    label = labels[0][0] if labels and labels[0][1] >= 0.25 else ""
+    return " ".join(words + ([label] if label else [])).strip()
+
+
+async def product_answer(ctx):
+    """Умная камера: что на фото + надписи → поиск по фото в Яндексе/Google и ссылки на магазины."""
+    src = ctx.reply
+    obj = (src.photo[-1] if src.photo else src.document) if src else None
+    if not obj or not ctx.file_bot:
+        return "⟪huh⟫ Ответь этим на фото товара, и я поищу."
+    path = await download(ctx.file_bot, obj, f"ugu_p_{src.chat.id}_{src.message_id}", ".jpg")
+    if not path:
+        return "⟪sad⟫ Не смог скачать фото, попробуй ещё раз."
+    try:
+        try:
+            import vision
+            res = await asyncio.to_thread(vision.analyze, str(path), str(ab.DATA / "vision"))
+            seen = vision.describe(res)
+        except Exception as e:
+            log.warning("угу: умная камера без распознавания: %s", e)
+            res, seen = {}, ""
+        url = publish_photo(path)
+    finally:
+        path.unlink(missing_ok=True)
+    query = product_query(res)
+    lines = [f"⟪find⟫ {html.escape(seen)}" if seen else "⟪find⟫ Ищу по фото."]
+    if url:
+        lines.append(f'🔎 Найти по фото: <a href="https://yandex.ru/images/search?rpt=imageview&url={quote_plus(url)}">Яндекс</a> · '
+                     f'<a href="https://lens.google.com/uploadbyurl?url={quote_plus(url)}">Google</a>')
+    if query:
+        remember_topic(ctx.owner, ctx.chat_id, query)
+        lines.append(shop_links(query))
+    return "\n".join(lines)
 
 
 def ab_bot():
@@ -579,7 +738,7 @@ async def edit_own(bot: Bot, msg: Message, text):
     for attempt in range(3):
         try:
             await say(lambda t: bot.edit_message_text(t, business_connection_id=msg.business_connection_id, chat_id=msg.chat.id,
-                                                      message_id=msg.message_id, link_preview_options=NO_PREVIEW), text)
+                                                      message_id=msg.message_id, link_preview_options=lp()), text)
             return True, ""
         except Exception as e:
             if "not modified" in str(e).lower():
@@ -594,7 +753,7 @@ async def edit_own(bot: Bot, msg: Message, text):
 async def send_in_chat(bot: Bot, msg: Message, text):
     try:
         await say(lambda t: bot.send_message(msg.chat.id, t, business_connection_id=msg.business_connection_id,
-                                             link_preview_options=NO_PREVIEW), text)
+                                             link_preview_options=lp()), text)
         return True
     except Exception as e:
         log.warning("угу: не написал в чат: %s", e)
@@ -669,8 +828,9 @@ def strip_name(text):
     return NAME_ANY.sub(" ", MENTION.sub(" ", text or "")).strip()
 
 
-def article(text):
-    return InlineQueryResultArticle(id=hashlib.md5(text.encode()).hexdigest()[:16], title="Угу",
+def article(text, title="Угу", description=None, keyboard=None):
+    return InlineQueryResultArticle(id=hashlib.md5(f"{title}{text}".encode()).hexdigest()[:16], title=title,
+                                    description=description, reply_markup=keyboard,
                                     input_message_content=InputTextMessageContent(message_text=text,
                                                                                   link_preview_options=NO_PREVIEW))
 
@@ -691,10 +851,13 @@ async def on_guest(msg: Message, bot: Bot):
         await say(lambda t: bot.answer_guest_query(msg.guest_query_id, article(t)),
                   f"⟪ghost⟫ Я Угу, помощник. Работаю для своих, подключиться: t.me/{UGU['username']}")
         return
+    if not question and msg.reply_to_message is None:
+        await say(lambda t: bot.answer_guest_query(msg.guest_query_id, article(t, keyboard=menu_kb())), MENU_TEXT)
+        return
     kind, _ = understand(question, msg.reply_to_message)
     if kind == "images":
         log_question(caller, question, kind, "guest")
-        q, found = await pick_images(question)
+        q, found = await pick_images(question, caller, msg.chat.id)
         if found:
             await bot.answer_guest_query(msg.guest_query_id, photo_results(found)[0])
             return
@@ -711,7 +874,7 @@ async def on_guest(msg: Message, bot: Bot):
     if len(public) > 3500:
         public = public[:3490] + "…"
     try:
-        await say(lambda t: bot.edit_message_text(t, inline_message_id=sent.inline_message_id, link_preview_options=NO_PREVIEW,
+        await say(lambda t: bot.edit_message_text(t, inline_message_id=sent.inline_message_id, link_preview_options=lp(),
                                                   reply_markup=choice_kb(ans)), public)
     except Exception as e:
         log.warning("угу: не обновил гостевой ответ: %s", e)
@@ -720,11 +883,47 @@ async def on_guest(msg: Message, bot: Bot):
 @router.inline_query()
 async def on_inline(query: InlineQuery, bot: Bot):
     text = (query.query or "").strip()
-    if not allowed(query.from_user.id) or len(text) < 2 or intent(text) not in ("unknown", "images"):
+    if not allowed(query.from_user.id):
+        await query.answer([], cache_time=60, is_personal=True)
+        return
+    if not text:
+        await query.answer([article(deco(MENU_TEXT, False), "👻 Меню Угу", "Картинки, интернет, что умею", menu_kb()),
+                            article(deco(HELP, False), "❓ Что умею", "Все команды и как звать")],
+                           cache_time=300, is_personal=False)
+        return
+    mode = INLINE_MODE.match(text)
+    if mode:
+        text = text[mode.end():].strip()
+    want_web = (mode and mode.group(1) in ("?", "и")) or (not mode and intent(text) in ("web", "look"))
+    if want_web and len(text) >= 3:
+        res = await websearch.lookup(text)
+        if not res:
+            await query.answer([], cache_time=30, is_personal=False)
+            return
+        body = websearch.format_answer(res)
+        title = (res["source"][0] if res["source"] else text)[:60]
+        await query.answer([article(deco("⟪web⟫ ", False) + body, f"🌐 {title}", res["text"][:120] or None)],
+                           cache_time=120, is_personal=False)
+        return
+    if len(text) < 2 or (not mode and intent(text) not in ("unknown", "images")):
         await query.answer([], cache_time=5, is_personal=True)
         return
-    found = await websearch.images(image_query(text), 20)
+    found = await websearch.images(image_query(text) or text, 20)
     await query.answer(photo_results(found), cache_time=300, is_personal=False)
+
+
+@router.callback_query(F.data == "ugh")
+async def on_menu_help(call: CallbackQuery, bot: Bot):
+    await call.answer()
+    try:
+        if call.inline_message_id:
+            await say(lambda t: bot.edit_message_text(t, inline_message_id=call.inline_message_id,
+                                                      link_preview_options=lp()), HELP.replace("👻", "⟪hi⟫", 1))
+        elif call.message:
+            await say(lambda t: bot.edit_message_text(t, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                                      link_preview_options=lp()), HELP.replace("👻", "⟪hi⟫", 1))
+    except Exception as e:
+        log.warning("угу: меню: %s", e)
 
 
 @router.message(CommandStart())
@@ -753,9 +952,9 @@ async def ugu_private(msg: Message, bot: Bot):
             log.warning("угу: альбом в личку: %s", e)
     try:
         await say(lambda t: bot.edit_message_text(t, chat_id=msg.chat.id, message_id=wait.message_id,
-                                                  link_preview_options=NO_PREVIEW, reply_markup=choice_kb(ans)), text)
+                                                  link_preview_options=lp(), reply_markup=choice_kb(ans)), text)
     except Exception:
-        await say(lambda t: msg.answer(t, link_preview_options=NO_PREVIEW, reply_markup=choice_kb(ans)), text)
+        await say(lambda t: msg.answer(t, link_preview_options=lp(), reply_markup=choice_kb(ans)), text)
 
 
 @router.callback_query(F.data.startswith("ugu:"))
@@ -777,10 +976,10 @@ async def on_pick(call: CallbackQuery, bot: Bot):
     try:
         if call.inline_message_id:
             await say(lambda t: bot.edit_message_text(t, inline_message_id=call.inline_message_id,
-                                                      link_preview_options=NO_PREVIEW), public)
+                                                      link_preview_options=lp()), public)
         elif call.message:
             await say(lambda t: bot.edit_message_text(t, chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                                      link_preview_options=NO_PREVIEW), public)
+                                                      link_preview_options=lp()), public)
     except Exception as e:
         log.warning("угу: не обновил ответ после выбора: %s", e)
     with ab.db() as con:

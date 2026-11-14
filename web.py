@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import base64
 import hashlib
@@ -223,6 +224,19 @@ async def send_to_chat(request):
     return reply({"ok": True})
 
 
+PUB_NAME = re.compile(r"^[0-9a-f]{32}\.jpg$")
+
+
+async def pub(request):
+    """Фото для поиска по картинке: случайное имя, живёт час, отдаётся только по точной ссылке."""
+    name = request.match_info["name"]
+    target = ab.DATA / "pub" / name
+    if not PUB_NAME.match(name) or not target.is_file():
+        raise web.HTTPNotFound(text="нет")
+    return web.FileResponse(target, headers={"Content-Type": "image/jpeg", "Cache-Control": "no-store",
+                                             "X-Robots-Tag": "noindex"})
+
+
 def make_app(bot):
     app = web.Application(client_max_size=64 * 1024)
     app["bot"] = bot
@@ -235,6 +249,7 @@ def make_app(bot):
     app.router.add_get("/api/search", search)
     app.router.add_get("/api/media", media)
     app.router.add_post("/api/send", send_to_chat)
+    app.router.add_get("/pub/{name}", pub)
     return app
 
 
