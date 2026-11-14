@@ -15,8 +15,9 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InlineQuery, InlineQueryResultArticle,
-                           InlineQueryResultPhoto, InputMediaPhoto, InputTextMessageContent, LinkPreviewOptions, Message)
+from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InlineQuery,
+                           InlineQueryResultArticle, InlineQueryResultCachedPhoto, InlineQueryResultPhoto, InputMediaPhoto,
+                           InputTextMessageContent, LinkPreviewOptions, Message)
 
 import archive_bot as ab
 import llm
@@ -49,7 +50,11 @@ INTENTS = [
     ("chat", r"^(привет\w*|здравствуй\w*|добр\w+ (утро|день|вечер|ночи)|как (твои |у тебя )?дела|как ты\b|как сам|как жизнь|"
              r"что делаешь|чем занят|ты (тут|здесь|живой|кто)|кто ты|спасибо|благодар|молодец|красава|умница|"
              r"люблю тебя|ты лучший|ты (дурак|тупой|глупый)|тупой бот|пока\b|спокойной ночи|доброй ночи)"),
-    ("remind", r"\bнапомн"),
+    ("fun", r"^(инфа|информация|вероятность|шанс)\b|^выбери\b.+\bили\b|^(данет|да или нет)\b|^(рандом|случайное число)\b|"
+            r"^(с?кинь |брось |подбрось )?(монетк\w*|монету)\b|^орёл или решка|^орел или решка|^(с?кинь |брось )?(кубик|кости)\b"),
+    ("note", r"^[+]\s*заметк|^[-]\s*заметк|^(мои )?заметки\b|^заметка\b|^запиши\b|^сохрани (в заметки|заметку)|^в заметки\b"),
+    ("stats", r"\b(стата|статистик\w*)\b|кто (больше|чаще) (пишет|пишем)|во сколько (мы )?(обычно )?(переписыва|общаемся)|сколько (у нас )?сообщений"),
+    ("remind", r"\bнапомн|^таймер\b"),
     ("deleted", r"удал[её]н|удалил|удалили|стёр|стер\b|стерли|стёрли"),
     ("images", r"\b(скинь|покажи|найди|дай|пришли|отправь|го|хочу|нужн\w*|можно)\b.{0,40}\b(картинк\w*|фото|мем\w*|гифк\w*|обои|арт\w*|"
                r"пикч\w*|изображени\w*)\b|^(картинк\w*|фото|мем\w*|обои|пикч\w*)\b|\b(мем|мемы|мемов)\b|покажи,? как выгляд"),
@@ -71,7 +76,7 @@ INTENTS = [
 ]
 INTENTS = [(name, re.compile(rx, re.I)) for name, rx in INTENTS]
 EXPLICIT = {"remind", "deleted", "schedule", "images", "summary", "promises", "find"}
-STRONG = {"help", "remind", "deleted", "schedule", "promises", "summary", "voice", "images", "photo", "find"}
+STRONG = {"fun", "note", "stats", "first", "help", "remind", "deleted", "schedule", "promises", "summary", "voice", "images", "photo", "find"}
 FIND_WORDS = re.compile(r"(?i)\b(найди|поищи|где|когда|он|она|ты|я|мы|мне|в (этой )?(переписке|чате)|скидывал\w*|кидал\w*|"
                         r"писал\w*|присылал\w*|говорил\w*|отправлял\w*)\b")
 IMAGE_WORDS = re.compile(r"(?i)\b(скинь|покажи|найди|дай|пришли|отправь|го|хочу|нужн\w*|можно|мне|нам|сюда|в чат|"
@@ -84,7 +89,11 @@ HELP = ("👻 Я Угу, призрак твоих переписок: вижу 
         "• в любом чате: «@ugu_ai вопрос», отвечу сам;\n"
         "• «@ugu_ai котики» в строке ввода: картинки, выбирай и отправляй.\n\n"
         "Умею: расписание и напоминания, о чём договорились, что обещали, найти в переписке, "
-        "что удалили (только тебе в личку), расшифровать ГС, что на фото, ответ из интернета со ссылками.")
+        "что удалили (только тебе в личку), расшифровать ГС, что на фото, ответ из интернета со ссылками, "
+        "погода, курс, калькулятор, когда вы познакомились, статистика чата.\n"
+        "Приколы: «инфа что…», «выбери А или Б», «данет», «рандом 1 100», «монетка», «кубик».\n"
+        "Заметки: «+заметка купить молоко», «заметки», «-заметка 3».\n"
+        "Фото (ответом на картинку): «демотиватор Текст», «шакал», «жмых», «текст на пикчу верх | низ».")
 
 
 @dataclass
@@ -106,6 +115,7 @@ class Answer:
     images: list = field(default_factory=list)
     choices: list = field(default_factory=list)
     qid: str = ""
+    photo: bytes = b""
 
 
 def deco(text, custom=True):
@@ -156,6 +166,8 @@ def intent(question, reply=None):
     if reply is not None:
         explicit = any(rx.search(q) for name, rx in INTENTS if name in EXPLICIT)
         is_image = reply.photo or (reply.document and (reply.document.mime_type or "").startswith("image/"))
+        if is_image and FX_RX.match(q):
+            return "fx"
         if is_image and PRODUCT_RX.search(q):
             return "product"
         if not explicit and is_image:
@@ -315,6 +327,141 @@ def search(owner, words, chat_id=None, limit=3):
     scored = sorted(((match_score(words, r["text"]), r) for r in rows if not is_noise(r["text"])),
                     key=lambda x: (x[0], x[1]["date"]), reverse=True)
     return [r for s, r in scored if s > 0][:limit]
+
+
+# ---------- приколы, заметки, статистика, фото-эффекты (идеи Ириса и Демотика) ----------
+
+FX_RX = re.compile(r"(?i)^(демотиватор\w*|демотив\w*|демк\w*|шакал\w*|жмых\w*|текст на (пикчу|фото|картинку)|мем\b|подпиши|надпись)")
+YES_NO = ["Да.", "Нет.", "Скорее да.", "Скорее нет.", "Сто процентов да.", "Даже не думай.", "Спроси завтра.", "Звёзды говорят да."]
+
+
+def fun_answer(question):
+    q = slang.normalize(question).strip()
+    low = q.lower()
+    m = re.match(r"(?i)^(инфа|информация|вероятность|шанс)\s*(что|на то что|того что)?\s*(.*)$", q)
+    if m:
+        what = m.group(3).strip(" ?") or "это правда"
+        seed = int(hashlib.md5(f"{what.lower()}{now():%Y%m%d}".encode()).hexdigest(), 16)
+        return f"⟪think⟫ Вероятность, что {html.escape(what)}: <b>{seed % 101}%</b>"
+    m = re.match(r"(?i)^выбери\s*:?\s*(.+)$", q)
+    if m:
+        options = [o.strip(" ?.!") for o in re.split(r"(?i)\s+или\s+|,", m.group(1)) if o.strip(" ?.!")]
+        if len(options) >= 2:
+            return f"⟪boo⟫ Выбираю: <b>{html.escape(random.choice(options))}</b>"
+    if re.match(r"(?i)^(данет|да или нет)", low):
+        return f"⟪think⟫ {random.choice(YES_NO)}"
+    m = re.match(r"(?i)^(рандом|случайное число)\s*(?:от\s*)?(-?\d+)?\s*(?:до|-)?\s*(-?\d+)?", q)
+    if m:
+        a, b = int(m.group(2) or 1), int(m.group(3) or 100)
+        a, b = min(a, b), max(a, b)
+        return f"⟪boo⟫ Случайное число от {a} до {b}: <b>{random.randint(a, b)}</b>"
+    if re.search(r"(?i)монет|орёл|орел", low):
+        return f"⟪boo⟫ {random.choice(['🪙 Орёл', '🪙 Решка'])}"
+    if re.search(r"(?i)кубик|кости", low):
+        return f"⟪boo⟫ 🎲 Выпало: <b>{random.randint(1, 6)}</b>"
+    return "⟪huh⟫ Умею: «инфа что завтра дождь», «выбери пицца или суши», «данет», «рандом 1 100», «монетка», «кубик»."
+
+
+def notes_table(con):
+    con.execute("CREATE TABLE IF NOT EXISTS ugu_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, title TEXT, "
+                "body TEXT, created TEXT, pinned INTEGER DEFAULT 0)")
+
+
+def note_answer(ctx):
+    q = slang.normalize(ctx.question).strip()
+    with ab.db() as con:
+        notes_table(con)
+        m = re.match(r"(?i)^[-]\s*заметк\w*\s*(.*)$", q)
+        if m:
+            key = m.group(1).strip()
+            row = con.execute("SELECT id, title FROM ugu_notes WHERE owner_id=? AND (CAST(id AS TEXT)=? OR ulower(title)=?)"
+                              " ORDER BY id DESC LIMIT 1", (ctx.owner, key, key.lower())).fetchone()
+            if not row:
+                return Answer(public=f"⟪huh⟫ Заметку «{html.escape(key)}» не нашёл. Список: «заметки».")
+            con.execute("DELETE FROM ugu_notes WHERE id=?", (row["id"],))
+            return Answer(public=f"⟪trash⟫ Удалил заметку «{html.escape(row['title'])}».")
+        m = re.match(r"(?i)^([+]\s*заметк\w*|запиши( в заметки)?|сохрани (в заметки|заметку)|в заметки)\s*:?\s*(.*)$", q, re.S)
+        if m and m.group(4).strip():
+            body = m.group(4).strip()
+            title, _, rest = body.partition("\n")
+            title = title.strip()[:60]
+            con.execute("INSERT INTO ugu_notes (owner_id, title, body, created) VALUES (?,?,?,?)",
+                        (ctx.owner, title, (rest.strip() or body)[:4000], now().strftime("%Y-%m-%d %H:%M:%S")))
+            return Answer(public=f"⟪ok⟫ Записал в заметки: «{html.escape(title)}».")
+        m = re.match(r"(?i)^заметка\s+(.+)$", q)
+        if m:
+            key = m.group(1).strip()
+            row = con.execute("SELECT * FROM ugu_notes WHERE owner_id=? AND (CAST(id AS TEXT)=? OR ulower(title) LIKE ?)"
+                              " ORDER BY id DESC LIMIT 1", (ctx.owner, key, f"%{key.lower()}%")).fetchone()
+            text = (f"📝 <b>{html.escape(row['title'])}</b>\n{html.escape(row['body'])}" if row
+                    else f"⟪huh⟫ Заметку «{html.escape(key)}» не нашёл.")
+            return Answer(private=text, public="" if not ctx.chat_id else "⟪mail⟫ Заметку прислал тебе в личку.")
+        rows = con.execute("SELECT id, title, created FROM ugu_notes WHERE owner_id=? ORDER BY pinned DESC, id DESC LIMIT 15",
+                           (ctx.owner,)).fetchall()
+    if not rows:
+        return Answer(public="📝 Заметок пока нет. Добавить: «угубот, +заметка купить молоко».")
+    text = "📝 Твои заметки:\n" + "\n".join(f"{r['id']}. {html.escape(r['title'])} ({r['created'][8:10]}.{r['created'][5:7]})" for r in rows)
+    text += "\nОткрыть: «заметка 3», удалить: «-заметка 3»."
+    return Answer(private=text, public="" if not ctx.chat_id else "⟪mail⟫ Список заметок прислал тебе в личку.")
+
+
+def stats_answer(ctx):
+    with ab.db() as con:
+        rows = [dict(r) for r in con.execute("SELECT sender_id, date, text, media_type, deleted FROM messages"
+                                             " WHERE owner_id=? AND chat_id=?", (ctx.owner, ctx.chat_id))]
+    rows = [r for r in rows if not is_noise(r["text"])]
+    if not rows:
+        return "⟪huh⟫ В этом чате у меня пока нет сообщений."
+    mine = sum(1 for r in rows if r["sender_id"] == ctx.owner)
+    hours = {}
+    for r in rows:
+        h = int(r["date"][11:13])
+        hours[h] = hours.get(h, 0) + 1
+    top_hour = max(hours, key=hours.get)
+    days = sorted({r["date"][:10] for r in rows})
+    media = sum(1 for r in rows if r["media_type"])
+    deleted = sum(1 for r in rows if r["deleted"])
+    share = round(mine * 100 / len(rows))
+    who = "ты" if share > 55 else ("собеседник" if share < 45 else "поровну")
+    return (f"⟪see⟫ Статистика чата (с {days[0][8:10]}.{days[0][5:7]}):\n"
+            f"• сообщений: <b>{len(rows)}</b>, в среднем {round(len(rows) / max(len(days), 1))} в день активности\n"
+            f"• твоих {share}%, собеседника {100 - share}%, больше пишет: <b>{who}</b>\n"
+            f"• чаще всего переписываетесь около <b>{top_hour}:00</b>\n"
+            f"• медиа: {media}, удалено: {deleted}")
+
+
+async def fx_answer(ctx):
+    src = ctx.reply
+    obj = (src.photo[-1] if src.photo else src.document) if src else None
+    if not obj or not ctx.file_bot:
+        return Answer(public="⟪huh⟫ Ответь этим на фото: «демотиватор Текст», «шакал», «жмых», «текст на пикчу верх | низ».")
+    q = slang.normalize(ctx.question).strip()
+    m = FX_RX.match(q)
+    kind, rest = m.group(1).lower(), q[m.end():].strip(" :-")
+    path = await download(ctx.file_bot, obj, f"ugu_fx_{src.chat.id}_{src.message_id}", ".jpg")
+    if not path:
+        return Answer(public="⟪sad⟫ Не смог скачать фото.")
+    try:
+        import fx
+        fonts = str(ab.DATA / "fonts")
+        if kind.startswith("шакал"):
+            data = await asyncio.to_thread(fx.shakal, str(path))
+        elif kind.startswith("жмых"):
+            data = await asyncio.to_thread(fx.zhmykh, str(path))
+        elif kind.startswith("демо") or kind.startswith("демк"):
+            title, _, sub = (rest or "когда понял, что это демотиватор").partition("|")
+            data = await asyncio.to_thread(fx.demotivator, str(path), title.strip(), sub.strip(), fonts)
+        else:
+            top, sep, bottom = rest.partition("|")
+            if not sep:
+                top, bottom = "", rest
+            data = await asyncio.to_thread(fx.meme_text, str(path), top.strip(), bottom.strip(), fonts)
+    except Exception as e:
+        log.warning("угу: эффект не получился: %s", e)
+        return Answer(public="⟪sad⟫ Эффект не получился, попробуй другое фото.")
+    finally:
+        path.unlink(missing_ok=True)
+    return Answer(photo=data)
 
 
 async def first_answer(ctx):
@@ -543,7 +690,7 @@ SEM = {"clf": None, "broken": False}
 CONVO = {"chat", "help"}
 LABELS = {"schedule": "📅 Мои планы", "find": "🔎 Найти в переписке", "web": "🌐 Интернет", "promises": "🤝 Договорённости",
           "summary": "🧾 Кратко о чате", "deleted": "🗑 Удалённое", "images": "📷 Картинка", "chat": "💬 Поболтать",
-          "help": "❓ Что умею", "first": "🗓 Когда познакомились", "remind": "⏰ Напомнить", "voice": "🎤 Расшифровать ГС", "photo": "📷 Что на фото",
+          "help": "❓ Что умею", "first": "🗓 Когда познакомились", "fun": "🎲 Рандом", "note": "📝 Заметки", "stats": "📊 Статистика чата", "remind": "⏰ Напомнить", "voice": "🎤 Расшифровать ГС", "photo": "📷 Что на фото",
           "look": "🖼 Как выглядит", "shop": "🛒 Где купить", "product": "🔎 Найти товар по фото"}
 MENU_TEXT = "⟪hi⟫ Чем помочь? Нажми кнопку, допиши запрос и отправь:"
 INLINE_MODE = re.compile(r"(?i)^(к|pic|картинки|картинка|фото|\?|и)\s+")
@@ -658,6 +805,16 @@ async def brain(ctx: Ctx) -> Answer:
         return Answer(public="⟪alarm⟫ Записал, напомню.")
     if kind in ("deleted", "promises", "summary") and not in_chat:
         return Answer(public="⟪sad⟫ Этот чат я не веду, поэтому по нему не подскажу.")
+    if kind == "fun":
+        return Answer(public=fun_answer(ctx.question))
+    if kind == "note":
+        return note_answer(ctx)
+    if kind == "stats":
+        if not in_chat:
+            return Answer(public="⟪huh⟫ Этот чат я не веду, статистики по нему нет.")
+        return Answer(public=stats_answer(ctx))
+    if kind == "fx":
+        return await fx_answer(ctx)
     if kind == "first":
         if not in_chat:
             return Answer(public="⟪huh⟫ Этот чат я не веду, поэтому не знаю, когда вы начали переписку.")
@@ -853,6 +1010,14 @@ async def answer_by_name(msg: Message, bot: Bot, owner, prefix, question):
     if ans.private:
         notify(owner, ans.private)
     public = ans.public
+    if ans.photo:
+        try:
+            await bot.send_photo(msg.chat.id, BufferedInputFile(ans.photo, "ugu.jpg"),
+                                 business_connection_id=msg.business_connection_id)
+            public = ""
+        except Exception as e:
+            log.warning("угу: фото-эффект не отправил: %s", e)
+            public = "⟪sad⟫ Не смог отправить картинку в чат."
     if ans.images and await send_album(bot, msg, ans.images, html.unescape(re.sub(r"<[^>]+>", "", deco(public, False)))):
         public = ""
     if not thinking:
@@ -914,6 +1079,21 @@ async def on_guest(msg: Message, bot: Bot):
         if found:
             await bot.answer_guest_query(msg.guest_query_id, photo_results(found)[0])
             return
+    if kind == "fx":
+        ans = await brain(Ctx(caller, question, None, "", msg.reply_to_message, bot))
+        if ans.photo:
+            try:
+                stored = await bot.send_photo(ab.STORE_CHAT_ID, BufferedInputFile(ans.photo, "ugu.jpg"),
+                                              caption=f"fx для {caller}"[:100])
+                result = InlineQueryResultCachedPhoto(id=hashlib.md5(ans.photo[:4096]).hexdigest()[:16],
+                                                      photo_file_id=stored.photo[-1].file_id)
+                await bot.answer_guest_query(msg.guest_query_id, result)
+                return
+            except Exception as e:
+                log.warning("угу: фото-эффект в гостевом ответе: %s", e)
+                ans = Answer(public="⟪sad⟫ Картинку сделал, но Telegram не принял её в ответ.")
+        await say(lambda t: bot.answer_guest_query(msg.guest_query_id, article(t)), ans.public or "⟪sad⟫ Не получилось.")
+        return
     sent = await say(lambda t: bot.answer_guest_query(msg.guest_query_id, article(t)), THINK)
     chat_id = msg.chat.id if has_chat(caller, msg.chat.id) else None
     try:
@@ -1007,6 +1187,13 @@ async def ugu_private(msg: Message, bot: Bot):
     reply = msg if (msg.photo or msg.voice or msg.video_note or msg.document) else msg.reply_to_message
     wait = await say(msg.answer, THINK)
     ans = await brain(Ctx(msg.from_user.id, question, None, "", reply, bot, can_ask=True))
+    if ans.photo:
+        await bot.send_photo(msg.chat.id, BufferedInputFile(ans.photo, "ugu.jpg"))
+        try:
+            await bot.delete_message(msg.chat.id, wait.message_id)
+        except Exception:
+            pass
+        return
     text = "\n\n".join(x for x in (ans.public, ans.private) if x) or "⟪ok⟫ Готово."
     text = text if len(text) <= 3500 else text[:3490] + "…"
     if ans.images:
