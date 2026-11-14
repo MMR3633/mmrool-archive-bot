@@ -665,12 +665,15 @@ async def ugu_private(msg: Message, bot: Bot):
 
 async def setup_profile(bot: Bot):
     from aiogram.types import BotCommand
-    try:
-        await bot.set_my_commands([BotCommand(command="start", description="Кто такой Угу и как звать")])
-        await bot.set_my_short_description("Призрак твоих переписок: вижу всё, даже удалённое. Зови «угубот» в переписке или @ugu_ai в любом чате.")
-        await bot.set_my_description(HELP)
-    except Exception as e:
-        log.warning("угу: профиль не обновил: %s", e)
+    for attempt in range(10):
+        try:
+            await bot.set_my_commands([BotCommand(command="start", description="Кто такой Угу и как звать")])
+            await bot.set_my_short_description("Призрак твоих переписок: вижу всё, даже удалённое. Зови «угубот» в переписке или @ugu_ai в любом чате.")
+            await bot.set_my_description(HELP)
+            return
+        except Exception as e:
+            log.warning("угу: профиль не обновил (%s): %s", attempt + 1, e)
+            await asyncio.sleep(30)
 
 
 async def run(token, archive_bot: Bot):
