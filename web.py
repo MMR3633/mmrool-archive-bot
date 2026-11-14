@@ -98,7 +98,8 @@ async def login(request):
         body = await request.json()
     except (json.JSONDecodeError, UnicodeDecodeError):
         raise web.HTTPBadRequest(text="нужен JSON", headers=HEADERS)
-    uid = check_init_data(str(body.get("initData", "")))
+    data = str(body.get("initData", ""))
+    uid = check_init_data(data) or (check_init_data(data, ab.UGU_TOKEN) if ab.UGU_TOKEN else None)
     if not uid:
         raise web.HTTPUnauthorized(text="подпись Telegram не сошлась", headers=HEADERS)
     return reply({"token": make_token(uid), "has_archive": ab.owner_has_archive(uid)})
@@ -179,7 +180,7 @@ async def media(request):
     chat = int_arg(request, "chat")
     mid = int_arg(request, "id")
     with ab.db() as con:
-        row = con.execute("SELECT store_file_id, store_kind, ext FROM messages WHERE owner_id=? AND chat_id=?"
+        row = con.execute("SELECT store_file_id, store_kind, ext, store_bot FROM messages WHERE owner_id=? AND chat_id=?"
                           " AND message_id=?", (uid, chat, mid)).fetchone()
     if not row or not row["store_file_id"]:
         raise web.HTTPNotFound(text="файла нет", headers=HEADERS)
@@ -188,7 +189,7 @@ async def media(request):
     name = hashlib.sha256(f"{uid}:{chat}:{mid}".encode()).hexdigest()[:24]
     target = cache / f"c_{name}{row['ext'] or ''}"
     if not target.exists():
-        bot = request.app["bot"]
+        bot = ab.bot_by(row["store_bot"] or "archive", request.app["bot"])
         part = target.with_suffix(target.suffix + ".part")
         for attempt in range(3):
             try:

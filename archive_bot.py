@@ -15,7 +15,7 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, Filter
 from aiogram.types import (BusinessConnection, BusinessMessagesDeleted, CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, MenuButtonWebApp, Message, WebAppInfo)
 
@@ -35,6 +35,7 @@ MSK = timezone(timedelta(hours=3))
 
 log = logging.getLogger("archive")
 router = Router()
+BOTS = {}
 CONN_OWNER = {}
 ARCHIVING = set()
 TRIGGER_IDS = set()
@@ -106,8 +107,11 @@ def init_db():
             con.execute(MESSAGES_SCHEMA)
         con.execute("CREATE INDEX IF NOT EXISTS idx_msg_chat ON messages(owner_id, chat_id, date)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_msg_store ON messages(store_file_id)")
+        con.execute("CREATE TABLE IF NOT EXISTS bot_users (user_id INTEGER, bot TEXT, seen TEXT, PRIMARY KEY (user_id, bot))")
+        con.execute("CREATE TABLE IF NOT EXISTS conn_bot (id TEXT PRIMARY KEY, bot TEXT)")
         for table, column in (("edits", "owner_id INTEGER"), ("outbox", "ref_owner INTEGER"),
-                              ("outbox", "ref_chat INTEGER"), ("outbox", "ref_msg INTEGER")):
+                              ("outbox", "ref_chat INTEGER"), ("outbox", "ref_msg INTEGER"), ("outbox", "via TEXT"),
+                              ("messages", "recv_bot TEXT"), ("messages", "store_bot TEXT")):
             try:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
             except sqlite3.OperationalError:
@@ -121,6 +125,71 @@ def init_db():
 
 def now():
     return datetime.now(MSK).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------- два бота в одном процессе: архив и Угу ----------
+
+def bot_name(bot):
+    """Имя бота в реестре: 'archive' или 'ugu'. Неизвестный (тесты, один бот) = 'archive'."""
+    for name, b in BOTS.items():
+        if b is not None and bot is not None and b.id == bot.id:
+            return name
+    return "archive"
+
+
+def bot_by(name, default=None):
+    return BOTS.get(name) or BOTS.get("archive") or default
+
+
+class OnBot(Filter):
+    """Обработчик только для своего бота: общий Dispatcher кормит оба."""
+
+    def __init__(self, name):
+        self.name = name
+
+    async def __call__(self, event, bot: Bot) -> bool:
+        return bot_name(bot) == self.name
+
+
+def business_bot(owner):
+    """Чей бизнес-архив главный: подключён Угу = Угу, иначе архив-бот."""
+    with db() as con:
+        row = con.execute("SELECT 1 FROM connections c JOIN conn_bot b ON b.id=c.id WHERE c.user_id=? AND c.enabled=1"
+                          " AND b.bot='ugu'", (owner,)).fetchone()
+    return "ugu" if row else "archive"
+
+
+def handles(bot, owner):
+    """Если подключены оба бота, бизнес-события обрабатывает только главный, чтобы не было дублей."""
+    return len(BOTS) < 2 or bot_name(bot) == business_bot(owner)
+
+
+def via_for(user_id):
+    """Каким ботом писать человеку: тот, к которому подключён архив, иначе тот, кому он писал последним."""
+    if len(BOTS) < 2 or not user_id:
+        return "archive"
+    with db() as con:
+        conn = con.execute("SELECT COALESCE(b.bot,'archive') b FROM connections c LEFT JOIN conn_bot b ON b.id=c.id"
+                           " WHERE c.user_id=? AND c.enabled=1 ORDER BY (COALESCE(b.bot,'archive')='ugu') DESC, c.updated DESC"
+                           " LIMIT 1", (user_id,)).fetchone()
+        if conn:
+            return conn["b"]
+        seen = con.execute("SELECT bot FROM bot_users WHERE user_id=? ORDER BY seen DESC LIMIT 1", (user_id,)).fetchone()
+    return seen["bot"] if seen else "archive"
+
+
+def bot_for(user_id, default=None):
+    if len(BOTS) < 2:
+        return default or bot_by("archive")
+    return bot_by(via_for(user_id), default)
+
+
+def seen_user(user_id, bot):
+    if not user_id or len(BOTS) < 2:
+        return
+    with db() as con:
+        con.execute("INSERT INTO bot_users VALUES (?,?,?) ON CONFLICT(user_id, bot) DO UPDATE SET seen=excluded.seen",
+                    (user_id, bot_name(bot), now()))
 
 
 def person(user):
@@ -190,7 +259,7 @@ async def resolve_owner(bot: Bot, connection_id):
     for attempt in range(3):
         try:
             conn = await bot.get_business_connection(connection_id)
-            save_connection(conn)
+            save_connection(conn, bot_name(bot))
             return conn.user.id
         except Exception as e:
             log.warning("не узнал владельца подключения %s: %s", connection_id, e)
@@ -198,19 +267,21 @@ async def resolve_owner(bot: Bot, connection_id):
     return 0
 
 
-def save_connection(conn: BusinessConnection):
+def save_connection(conn: BusinessConnection, bot="archive"):
     CONN_OWNER[conn.id] = conn.user.id
     with db() as con:
         con.execute("INSERT OR REPLACE INTO connections VALUES (?, ?, ?, ?)",
                     (conn.id, conn.user.id, int(conn.is_enabled), now()))
+        con.execute("INSERT OR REPLACE INTO conn_bot VALUES (?, ?)", (conn.id, bot))
         con.execute("UPDATE messages SET owner_id=? WHERE owner_id=0 AND connection_id=?", (conn.user.id, conn.id))
 
 
-def enqueue(chat_id, kind, text=None, ref=None):
+def enqueue(chat_id, kind, text=None, ref=None, via=None):
     ref = ref or (None, None, None)
+    via = via or via_for(chat_id)
     with db() as con:
-        con.execute("INSERT INTO outbox (chat_id, kind, text, created, ref_owner, ref_chat, ref_msg)"
-                    " VALUES (?,?,?,?,?,?,?)", (chat_id, kind, text, now(), *ref))
+        con.execute("INSERT INTO outbox (chat_id, kind, text, created, ref_owner, ref_chat, ref_msg, via)"
+                    " VALUES (?,?,?,?,?,?,?,?)", (chat_id, kind, text, now(), *ref, via))
 
 
 def notify(chat_id, text):
@@ -227,11 +298,20 @@ def archive_keyboard():
 
 @router.business_connection()
 async def on_connection(conn: BusinessConnection, bot: Bot):
-    save_connection(conn)
+    save_connection(conn, bot_name(bot))
     if conn.is_enabled:
         notify(conn.user.id, "Архив подключён, сохраняю все личные переписки. Открыть архив: кнопка «Архив» внизу.")
     else:
         notify(conn.user.id, "Архив отключён. Сохранённое останется, пока ты не попросишь удалить.")
+
+
+def mark_recv(owner, msg: Message, bot):
+    """Какой бот получил сообщение: его file_id скачивается только этим ботом."""
+    if len(BOTS) < 2:
+        return
+    with db() as con:
+        con.execute("UPDATE messages SET recv_bot=? WHERE owner_id=? AND chat_id=? AND message_id=?",
+                    (bot_name(bot), owner, msg.chat.id, msg.message_id))
 
 
 def store_row(owner, msg: Message, quoted=False):
@@ -261,6 +341,8 @@ async def on_message(msg: Message, bot: Bot):
     if from_guest_bot(msg):
         return
     owner = await resolve_owner(bot, msg.business_connection_id)
+    if not handles(bot, owner):
+        return
     mine = bool(msg.from_user and msg.from_user.id == owner)
     import assistant
     try:
@@ -272,6 +354,7 @@ async def on_message(msg: Message, bot: Bot):
         await remove_trigger(msg, bot, owner)
     else:
         label, file_id, size = store_row(owner, msg)
+        mark_recv(owner, msg, bot)
         if file_id:
             asyncio.create_task(archive_row(bot, owner, msg.chat.id, msg.message_id))
         if (msg.voice or msg.video_note) and not mine:
@@ -319,7 +402,7 @@ async def on_edit(msg: Message, bot: Bot):
     if from_guest_bot(msg):
         return
     owner = await resolve_owner(bot, msg.business_connection_id)
-    if (owner, msg.chat.id, msg.message_id) in TRIGGER_IDS:
+    if not handles(bot, owner) or (owner, msg.chat.id, msg.message_id) in TRIGGER_IDS:
         return
     new_text = body_of(msg)
     with db() as con:
@@ -350,6 +433,8 @@ async def on_edit(msg: Message, bot: Bot):
 @router.deleted_business_messages()
 async def on_delete(event: BusinessMessagesDeleted, bot: Bot):
     owner = await resolve_owner(bot, event.business_connection_id)
+    if not handles(bot, owner):
+        return
     ids = [m for m in event.message_ids if (owner, event.chat.id, m) not in TRIGGER_IDS]
     if not ids:
         return
@@ -437,7 +522,7 @@ async def archive_row(bot: Bot, owner, chat_id, message_id):
             kind = "document"
             sent = await upload(bot, kind, path, caption)
         with db() as con:
-            con.execute("UPDATE messages SET store_file_id=?, store_msg_id=?, store_kind=?, file_path=NULL"
+            con.execute("UPDATE messages SET store_file_id=?, store_msg_id=?, store_kind=?, file_path=NULL, store_bot='" + bot_name(bot) + "'"
                         " WHERE owner_id=? AND chat_id=? AND message_id=?",
                         (file_id_of(sent), sent.message_id, kind, *key))
         Path(path).unlink(missing_ok=True)
@@ -452,10 +537,10 @@ async def archive_row(bot: Bot, owner, chat_id, message_id):
 async def archiver(bot: Bot, once=False):
     while True:
         with db() as con:
-            rows = con.execute("SELECT owner_id, chat_id, message_id FROM messages WHERE file_id IS NOT NULL"
+            rows = con.execute("SELECT owner_id, chat_id, message_id, recv_bot FROM messages WHERE file_id IS NOT NULL"
                                " AND store_file_id IS NULL AND dl_tries < 30 ORDER BY date DESC LIMIT 10").fetchall()
         for r in rows:
-            await archive_row(bot, r["owner_id"], r["chat_id"], r["message_id"])
+            await archive_row(bot_by(r["recv_bot"] or "archive", bot), r["owner_id"], r["chat_id"], r["message_id"])
         if once:
             return
         await asyncio.sleep(20)
@@ -467,18 +552,22 @@ async def deliver(bot: Bot, item):
         await bot.send_message(chat_id, text, reply_markup=None)
         return
     ref = (item["ref_owner"], item["ref_chat"], item["ref_msg"])
+    query = ("SELECT store_file_id, store_kind, store_msg_id, store_bot, recv_bot FROM messages WHERE owner_id=? AND chat_id=?"
+             " AND message_id=?")
     with db() as con:
-        row = con.execute("SELECT store_file_id, store_kind FROM messages WHERE owner_id=? AND chat_id=?"
-                          " AND message_id=?", ref).fetchone()
+        row = con.execute(query, ref).fetchone()
     if row and not row["store_file_id"]:
-        await archive_row(bot, *ref)
+        await archive_row(bot_by(row["recv_bot"] or "archive", bot), *ref)
         with db() as con:
-            row = con.execute("SELECT store_file_id, store_kind FROM messages WHERE owner_id=? AND chat_id=?"
-                              " AND message_id=?", ref).fetchone()
+            row = con.execute(query, ref).fetchone()
     if not row:
         return
     if not row["store_file_id"]:
         raise FileNotReady("файл ещё не в хранилище")
+    if (row["store_bot"] or "archive") != bot_name(bot) and row["store_msg_id"]:
+        await bot.copy_message(chat_id, STORE_CHAT_ID, row["store_msg_id"],
+                               caption=None if row["store_kind"] == "video_note" else text, parse_mode=None)
+        return
     fid, store_kind = row["store_file_id"], row["store_kind"]
     if store_kind == "photo":
         await bot.send_photo(chat_id, fid, caption=text, parse_mode=None)
@@ -516,7 +605,7 @@ async def sender(bot: Bot, once=False):
             await asyncio.sleep(2)
             continue
         try:
-            await deliver(bot, item)
+            await deliver(bot_by(item["via"] or "archive", bot), item)
             with db() as con:
                 con.execute("DELETE FROM outbox WHERE id=?", (item["id"],))
         except Exception as e:
@@ -553,7 +642,7 @@ async def answer(msg: Message, text, keyboard=None):
     notify(msg.chat.id, text)
 
 
-@router.message(CommandStart())
+@router.message(CommandStart(), OnBot("archive"))
 async def cmd_start(msg: Message):
     await answer(msg,
                  "Я храню все сообщения из твоих личных чатов. Каждое ГС и кружок сразу присылаю сюда, "
@@ -1008,24 +1097,36 @@ async def main():
         raise SystemExit("нет BOT_TOKEN или STORE_CHAT_ID в .env")
     init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bots = [bot]
+    for b in bots:
+        while True:
+            try:
+                await b.delete_webhook(drop_pending_updates=False)
+                await b.me()
+                break
+            except Exception as e:
+                log.warning("Telegram не отвечает на старте (%s), повтор через 15 сек", e)
+                await asyncio.sleep(15)
+    BOTS["archive"] = bot
+    ugu_bot = None
+    if UGU_TOKEN:
+        ugu_bot = Bot(UGU_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        while True:
+            try:
+                await ugu_bot.delete_webhook(drop_pending_updates=False)
+                await ugu_bot.me()
+                break
+            except Exception as e:
+                log.warning("угу: Telegram не отвечает (%s), повтор через 15 сек", e)
+                await asyncio.sleep(15)
+        BOTS["ugu"] = ugu_bot
+        bots.append(ugu_bot)
+    else:
+        log.info("угу: UGU_TOKEN не задан, работает только архив-бот")
     if WEB_PORT:
         import web
         await web.start(bot, WEB_PORT)
-    import assistant
-    assistant.init_db()
-    dp = Dispatcher()
-    dp.include_router(router)
-    dp.include_router(assistant.router)
-    import inline
-    dp.include_router(inline.router)
-    while True:
-        try:
-            await bot.delete_webhook(drop_pending_updates=False)
-            await bot.me()
-            break
-        except Exception as e:
-            log.warning("Telegram не отвечает на старте (%s), повтор через 15 сек", e)
-            await asyncio.sleep(15)
+    dp = build_dispatcher()
     global USER
     from userclient import UserClient
     USER = UserClient(DATA)
@@ -1034,19 +1135,49 @@ async def main():
     asyncio.create_task(archiver(bot))
     asyncio.create_task(setup_menu(bot))
     asyncio.create_task(janitor())
+    import assistant
     asyncio.create_task(assistant.loops(bot))
-    if UGU_TOKEN:
+    if ugu_bot:
         import ugu
-        asyncio.create_task(ugu.run(UGU_TOKEN, bot))
-    else:
-        log.info("угу: UGU_TOKEN не задан, @ugu_ai не запускаю")
+        asyncio.create_task(ugu.setup(ugu_bot))
     while True:
         try:
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            await dp.start_polling(*bots, allowed_updates=dp.resolve_used_update_types())
             break
         except Exception as e:
             log.warning("опрос Telegram упал (%s), перезапуск через 15 сек", e)
             await asyncio.sleep(15)
+
+
+def build_dispatcher():
+    """Один диспетчер на оба бота. Порядок: приветствие Угу, архив, помощник, inline архива, группы, Угу (последним: ловит всё в личке)."""
+    import assistant
+    import inline
+    import ugu
+    assistant.init_db()
+    dp = Dispatcher()
+
+    @dp.update.outer_middleware()
+    async def remember_bot(handler, event, data):
+        user = getattr(data.get("event_from_user"), "id", None)
+        if user:
+            try:
+                seen_user(user, data.get("bot"))
+            except Exception as e:
+                log.warning("bot_users: %s", e)
+        return await handler(event, data)
+
+    dp.include_router(ugu.start_router)
+    dp.include_router(router)
+    dp.include_router(assistant.router)
+    dp.include_router(inline.router)
+    try:
+        import groups
+        dp.include_router(groups.router)
+    except ImportError:
+        pass
+    dp.include_router(ugu.router)
+    return dp
 
 
 if __name__ == "__main__":

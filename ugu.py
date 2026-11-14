@@ -28,6 +28,11 @@ from timeparse import MSK
 
 log = logging.getLogger("archive.ugu")
 router = Router()
+router.message.filter(ab.OnBot("ugu"))
+router.inline_query.filter(ab.OnBot("ugu"))
+router.callback_query.filter(ab.OnBot("ugu"))
+start_router = Router()
+start_router.message.filter(ab.OnBot("ugu"))
 UGU = {"bot": None, "username": "ugu_ai", "guest": None}
 
 NAME_ANY = re.compile(r"(?i)(?<![\w@])(?:угу\s*-?\s*бот\w*|угубот\w*)(?!\w)[\s,:!.\-]*")
@@ -1206,7 +1211,7 @@ async def on_menu_help(call: CallbackQuery, bot: Bot):
         log.warning("угу: меню: %s", e)
 
 
-@router.message(CommandStart())
+@start_router.message(CommandStart())
 async def ugu_start(msg: Message):
     if allowed(msg.from_user.id):
         await say(msg.answer, HELP.replace("👻", "⟪hi⟫", 1) + "\n\nМожно и тут: спроси что угодно, пришли фото или голосовое.")
@@ -1295,28 +1300,32 @@ async def setup_profile(bot: Bot):
             await asyncio.sleep(30)
 
 
-async def run(token, archive_bot: Bot):
-    BOTS["archive"] = archive_bot
-    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+async def setup(bot: Bot):
+    """Угу в общем процессе: узнать себя, обновить профиль, загрузить понимание по смыслу, кнопку мини-аппа."""
     UGU["bot"] = bot
-    dp = Dispatcher()
-    dp.include_router(router)
-    while True:
-        try:
-            me = await bot.me()
-            UGU["username"], UGU["guest"] = me.username, me.supports_guest_queries
-            break
-        except Exception as e:
-            log.warning("угу: Telegram не отвечает (%s), повтор через 15 сек", e)
-            await asyncio.sleep(15)
+    BOTS["archive"] = ab.bot_by("archive")
+    me = await bot.me()
+    UGU["username"], UGU["guest"] = me.username, me.supports_guest_queries
     log.info("угу: @%s на связи, гостевой режим %s", UGU["username"], "включён" if UGU["guest"] else "ВЫКЛЮЧЕН в BotFather")
     asyncio.create_task(setup_profile(bot))
     asyncio.create_task(sem_start())
-    while True:
+    asyncio.create_task(setup_app_button(bot))
+    try:
+        import groups
+        asyncio.create_task(groups.timers_loop(bot))
+    except ImportError:
+        pass
+
+
+async def setup_app_button(bot: Bot):
+    if not ab.WEBAPP_URL:
+        return
+    from aiogram.types import MenuButtonWebApp, WebAppInfo
+    url = ab.WEBAPP_URL.rstrip("/") + "/u/"
+    for attempt in range(10):
         try:
-            await bot.delete_webhook(drop_pending_updates=False)
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), handle_signals=False)
-            break
+            await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Угу", web_app=WebAppInfo(url=url)))
+            return
         except Exception as e:
-            log.warning("угу: опрос упал (%s), перезапуск через 15 сек", e)
-            await asyncio.sleep(15)
+            log.warning("угу: кнопка мини-аппа (%s): %s", attempt + 1, e)
+            await asyncio.sleep(30)

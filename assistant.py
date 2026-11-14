@@ -104,6 +104,7 @@ def kb(*rows):
 
 
 async def send(bot: Bot, chat_id, text, keyboard=None):
+    bot = ab.bot_for(chat_id, bot)
     for attempt in range(4):
         try:
             return await bot.send_message(chat_id, text, reply_markup=keyboard, disable_web_page_preview=True)
@@ -117,6 +118,7 @@ async def send(bot: Bot, chat_id, text, keyboard=None):
 
 
 async def drop(bot: Bot, chat_id, ids):
+    bot = ab.bot_for(chat_id, bot)
     ids = [i for i in ids if i]
     for i in range(0, len(ids), 100):
         for attempt in range(3):
@@ -944,6 +946,7 @@ def export_args(text):
 
 async def run_export(bot: Bot, owner, target, since=None, until=None):
     from exporter import build_html, build_txt
+    bot = ab.bot_for(owner, bot)
     if owner != ab.OWNER_ID or ab.USER is None or not await ab.USER.ready():
         await send(bot, owner, "Для выгрузки нужен вход в аккаунт: /phone +7XXXXXXXXXX или /login.")
         return

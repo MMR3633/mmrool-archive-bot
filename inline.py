@@ -14,6 +14,8 @@ from timeparse import fmt, parse_when
 
 log = logging.getLogger("archive.inline")
 router = Router()
+router.inline_query.filter(ab.OnBot("archive"))
+router.chosen_inline_result.filter(ab.OnBot("archive"))
 
 ACTIONS = [
     ("гс", "📝", "Расшифровать последнее ГС", "Текст появится в чате ответом на ГС"),
