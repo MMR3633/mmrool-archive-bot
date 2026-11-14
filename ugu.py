@@ -13,8 +13,8 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import (InlineQuery, InlineQueryResultArticle, InlineQueryResultPhoto, InputMediaPhoto,
-                           InputTextMessageContent, LinkPreviewOptions, Message)
+from aiogram.types import (CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InlineQuery, InlineQueryResultArticle,
+                           InlineQueryResultPhoto, InputMediaPhoto, InputTextMessageContent, LinkPreviewOptions, Message)
 
 import archive_bot as ab
 import llm
@@ -53,7 +53,7 @@ INTENTS = [
                r"пикч\w*|изображени\w*)\b|^(картинк\w*|фото|мем\w*|обои|пикч\w*)\b|\b(мем|мемы|мемов)\b|как выгляд"),
     ("schedule", r"расписан|\bпланы?\b|по делам|какие (у меня )?дела|мои дела|что (у меня )?(на|по) (сегодня|завтра|недел)|"
                  r"что у меня (сегодня|завтра|на недел)|я (сегодня|завтра) свобод|напоминани|\bзадач"),
-    ("promises", r"обещ|договорил|договорён|договорен"),
+    ("promises", r"обещ|договорил|договорён|договорен|уговор|условил"),
     ("summary", r"сводк|пересказ|перескажи|о ч[её]м (мы )?(говорили|болтали|речь|переписк)|что было|кратко|итог"),
     ("voice", r"расшифр|что (он |она )?(сказал|говорит) в (гс|голосов)|текст (гс|голосов)"),
     ("photo", r"что (на|тут на|это на) (фото|картинк|скрин)|прочитай|что (тут|здесь) написано|что (это|тут) такое\??$"),
@@ -88,6 +88,8 @@ class Ctx:
     chat_title: str = ""
     reply: Message | None = None
     file_bot: Bot | None = None
+    kind: str | None = None
+    can_ask: bool = False
 
 
 @dataclass
@@ -95,6 +97,8 @@ class Answer:
     public: str = ""
     private: str = ""
     images: list = field(default_factory=list)
+    choices: list = field(default_factory=list)
+    qid: str = ""
 
 
 def deco(text, custom=True):
@@ -429,8 +433,99 @@ async def web_answer(question, strict=False):
     return "⟪web⟫ " + websearch.format_answer(res)
 
 
+# ---------- понимание по смыслу и кнопки «ты про это?» ----------
+
+SEM = {"clf": None, "broken": False}
+CONVO = {"chat", "help"}
+LABELS = {"schedule": "📅 Мои планы", "find": "🔎 Найти в переписке", "web": "🌐 Интернет", "promises": "🤝 Договорённости",
+          "summary": "🧾 Кратко о чате", "deleted": "🗑 Удалённое", "images": "📷 Картинка", "chat": "💬 Поболтать",
+          "help": "❓ Что умею", "remind": "⏰ Напомнить", "voice": "🎤 Расшифровать ГС", "photo": "📷 Что на фото"}
+
+
+def table(con):
+    con.execute("CREATE TABLE IF NOT EXISTS ugu_pending (qid TEXT PRIMARY KEY, owner_id INTEGER, question TEXT, chat_id INTEGER,"
+                " chat_title TEXT, created TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS ugu_learned (owner_id INTEGER, question TEXT, intent TEXT, created TEXT)")
+
+
+def learned():
+    with ab.db() as con:
+        table(con)
+        return [(r["question"], r["intent"]) for r in con.execute("SELECT question, intent FROM ugu_learned")]
+
+
+async def sem_start():
+    try:
+        import semantic
+        from ugu_examples import EXAMPLES
+        examples = {k: list(v) for k, v in EXAMPLES.items()}
+        for q, k in learned():
+            examples.setdefault(k, []).append(q)
+        clf = semantic.Classifier(examples, str(ab.DATA / "semantic"))
+        await asyncio.to_thread(clf.ready)
+        SEM["clf"] = clf
+        log.info("угу: понимание по смыслу готово, примеров %s", len(clf.texts))
+    except Exception as e:
+        SEM["broken"] = True
+        log.warning("угу: понимание по смыслу не запустилось, работаю на правилах: %s", e)
+
+
+def understand(question, reply=None):
+    """(намерение, варианты для кнопок). Правила точные, смысл подхватывает то, что правила не поняли."""
+    kind = intent(question, reply)
+    clf = SEM["clf"]
+    if clf is None or kind not in ("web", "unknown") or not (question or "").strip():
+        return kind, []
+    try:
+        rank = clf.rank(slang.normalize(question))
+    except Exception as e:
+        log.warning("угу: смысл не посчитал: %s", e)
+        return kind, []
+    (top, s1), (sec, s2) = rank[0], rank[1]
+    if kind == "web":
+        return (top, []) if top != "web" and s1 >= 0.90 and s1 - s2 >= 0.015 else ("web", [])
+    if s1 >= 0.86 and (s1 - s2 >= 0.02 or {top, sec} <= CONVO):
+        return top, []
+    if s1 >= 0.80:
+        return "unsure", [top, sec] + ([] if "web" in (top, sec) else ["web"])
+    return "unknown", []
+
+
+def ask_choice(ctx, alts):
+    qid = hashlib.md5(f"{ctx.owner}{ctx.question}{now()}".encode()).hexdigest()[:10]
+    with ab.db() as con:
+        table(con)
+        con.execute("INSERT OR REPLACE INTO ugu_pending VALUES (?,?,?,?,?,?)", (qid, ctx.owner, ctx.question, ctx.chat_id,
+                                                                              ctx.chat_title, now().strftime("%Y-%m-%d %H:%M:%S")))
+    return Answer(public="⟪huh⟫ Не уверен, что ты имел в виду. Выбери, я запомню:", choices=alts, qid=qid)
+
+
+def choice_kb(ans):
+    if not ans.choices:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=LABELS.get(k, k), callback_data=f"ugu:{ans.qid}:{k}")]
+                                                 for k in ans.choices])
+
+
+async def remember(owner, question, kind):
+    with ab.db() as con:
+        table(con)
+        con.execute("INSERT INTO ugu_learned VALUES (?,?,?,?)", (owner, question, kind, now().strftime("%Y-%m-%d %H:%M:%S")))
+    clf = SEM["clf"]
+    if clf is not None:
+        try:
+            await asyncio.to_thread(clf.add, kind, slang.normalize(question))
+        except Exception as e:
+            log.warning("угу: не дообучился: %s", e)
+
+
 async def brain(ctx: Ctx) -> Answer:
-    kind = intent(ctx.question, ctx.reply)
+    kind, alts = (ctx.kind, []) if ctx.kind else understand(ctx.question, ctx.reply)
+    if kind == "unsure":
+        if ctx.can_ask:
+            log_question(ctx.owner, ctx.question, "unsure:" + "/".join(alts), "chat" if ctx.chat_id else "direct")
+            return ask_choice(ctx, alts)
+        kind = alts[0]
     log_question(ctx.owner, ctx.question, kind, "chat" if ctx.chat_id else "direct")
     ctx.question = slang.normalize(ctx.question)
     in_chat = has_chat(ctx.owner, ctx.chat_id)
@@ -596,7 +691,7 @@ async def on_guest(msg: Message, bot: Bot):
         await say(lambda t: bot.answer_guest_query(msg.guest_query_id, article(t)),
                   f"⟪ghost⟫ Я Угу, помощник. Работаю для своих, подключиться: t.me/{UGU['username']}")
         return
-    kind = intent(question, msg.reply_to_message)
+    kind, _ = understand(question, msg.reply_to_message)
     if kind == "images":
         log_question(caller, question, kind, "guest")
         q, found = await pick_images(question)
@@ -606,7 +701,7 @@ async def on_guest(msg: Message, bot: Bot):
     sent = await say(lambda t: bot.answer_guest_query(msg.guest_query_id, article(t)), THINK)
     chat_id = msg.chat.id if has_chat(caller, msg.chat.id) else None
     try:
-        ans = await brain(Ctx(caller, question, chat_id, ab.chat_title(msg.chat), msg.reply_to_message, bot))
+        ans = await brain(Ctx(caller, question, chat_id, ab.chat_title(msg.chat), msg.reply_to_message, bot, can_ask=True))
     except Exception as e:
         log.exception("угу: ошибка в гостевом ответе")
         ans = Answer(public="⟪sad⟫ Что-то сломалось, попробуй ещё раз.")
@@ -616,8 +711,8 @@ async def on_guest(msg: Message, bot: Bot):
     if len(public) > 3500:
         public = public[:3490] + "…"
     try:
-        await say(lambda t: bot.edit_message_text(t, inline_message_id=sent.inline_message_id, link_preview_options=NO_PREVIEW),
-                  public)
+        await say(lambda t: bot.edit_message_text(t, inline_message_id=sent.inline_message_id, link_preview_options=NO_PREVIEW,
+                                                  reply_markup=choice_kb(ans)), public)
     except Exception as e:
         log.warning("угу: не обновил гостевой ответ: %s", e)
 
@@ -648,7 +743,7 @@ async def ugu_private(msg: Message, bot: Bot):
     question = strip_name(msg.text or msg.caption or "")
     reply = msg if (msg.photo or msg.voice or msg.video_note or msg.document) else msg.reply_to_message
     wait = await say(msg.answer, THINK)
-    ans = await brain(Ctx(msg.from_user.id, question, None, "", reply, bot))
+    ans = await brain(Ctx(msg.from_user.id, question, None, "", reply, bot, can_ask=True))
     text = "\n\n".join(x for x in (ans.public, ans.private) if x) or "⟪ok⟫ Готово."
     text = text if len(text) <= 3500 else text[:3490] + "…"
     if ans.images:
@@ -658,9 +753,38 @@ async def ugu_private(msg: Message, bot: Bot):
             log.warning("угу: альбом в личку: %s", e)
     try:
         await say(lambda t: bot.edit_message_text(t, chat_id=msg.chat.id, message_id=wait.message_id,
-                                                  link_preview_options=NO_PREVIEW), text)
+                                                  link_preview_options=NO_PREVIEW, reply_markup=choice_kb(ans)), text)
     except Exception:
-        await say(lambda t: msg.answer(t, link_preview_options=NO_PREVIEW), text)
+        await say(lambda t: msg.answer(t, link_preview_options=NO_PREVIEW, reply_markup=choice_kb(ans)), text)
+
+
+@router.callback_query(F.data.startswith("ugu:"))
+async def on_pick(call: CallbackQuery, bot: Bot):
+    _, qid, kind = (call.data.split(":") + ["", ""])[:3]
+    with ab.db() as con:
+        table(con)
+        row = con.execute("SELECT * FROM ugu_pending WHERE qid=?", (qid,)).fetchone()
+    if not row or row["owner_id"] != call.from_user.id or kind not in LABELS:
+        await call.answer("Это не твой вопрос или он устарел.", show_alert=True)
+        return
+    await call.answer("Понял, запомню")
+    await remember(row["owner_id"], row["question"], kind)
+    ans = await brain(Ctx(row["owner_id"], row["question"], row["chat_id"], row["chat_title"] or "", None, bot, kind=kind))
+    if ans.private:
+        notify(row["owner_id"], ans.private)
+    public = ans.public or ("⟪mail⟫ Скинул в личку." if ans.private else "⟪ok⟫ Готово.")
+    public = public if len(public) <= 3500 else public[:3490] + "…"
+    try:
+        if call.inline_message_id:
+            await say(lambda t: bot.edit_message_text(t, inline_message_id=call.inline_message_id,
+                                                      link_preview_options=NO_PREVIEW), public)
+        elif call.message:
+            await say(lambda t: bot.edit_message_text(t, chat_id=call.message.chat.id, message_id=call.message.message_id,
+                                                      link_preview_options=NO_PREVIEW), public)
+    except Exception as e:
+        log.warning("угу: не обновил ответ после выбора: %s", e)
+    with ab.db() as con:
+        con.execute("DELETE FROM ugu_pending WHERE qid=?", (qid,))
 
 
 async def setup_profile(bot: Bot):
@@ -692,6 +816,7 @@ async def run(token, archive_bot: Bot):
             await asyncio.sleep(15)
     log.info("угу: @%s на связи, гостевой режим %s", UGU["username"], "включён" if UGU["guest"] else "ВЫКЛЮЧЕН в BotFather")
     asyncio.create_task(setup_profile(bot))
+    asyncio.create_task(sem_start())
     while True:
         try:
             await bot.delete_webhook(drop_pending_updates=False)
