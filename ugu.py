@@ -40,6 +40,7 @@ NAME_ANY = re.compile(r"(?i)(?<![\w@])(?:угу\s*-?\s*бот\w*|угубот\w*
 NAME_LEAD = re.compile(r"(?i)^\s*угу\s*[,:!]\s*(.+)$", re.S)
 MENTION = re.compile(r"(?i)@ugu_ai(_bot)?\b[\s,:!.\-]*")
 CALL_MAX = 300
+GUEST_WAIT = 90
 THINK = "⟪think⟫ …"
 EMO = {"ghost": "👻", "think": "💭", "ok": "✅", "find": "🔎", "calendar": "📅", "alarm": "⏰", "mail": "📩", "huh": "❓",
        "web": "🌐", "trash": "🗑", "photo": "📷", "hi": "👋", "love": "❤️", "sleep": "💤", "voice": "🎤", "boo": "😜",
@@ -1176,7 +1177,11 @@ async def on_guest(msg: Message, bot: Bot):
     sent = await say(lambda t: bot.answer_guest_query(msg.guest_query_id, article(t)), THINK)
     chat_id = msg.chat.id if has_chat(caller, msg.chat.id) else None
     try:
-        ans = await brain(Ctx(caller, question, chat_id, ab.chat_title(msg.chat), msg.reply_to_message, bot, can_ask=True))
+        ans = await asyncio.wait_for(
+            brain(Ctx(caller, question, chat_id, ab.chat_title(msg.chat), msg.reply_to_message, bot, can_ask=True)), GUEST_WAIT)
+    except asyncio.TimeoutError:
+        log.warning("угу: гостевой ответ не уложился в %s с: %s", GUEST_WAIT, question[:80])
+        ans = Answer(public="⟪sad⟫ Не успел: долго думал. Попробуй ещё раз, обычно со второго раза быстрее.")
     except Exception as e:
         log.exception("угу: ошибка в гостевом ответе")
         ans = Answer(public="⟪sad⟫ Что-то сломалось, попробуй ещё раз.")
