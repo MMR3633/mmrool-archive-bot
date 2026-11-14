@@ -1237,13 +1237,22 @@ async def on_pick(call: CallbackQuery, bot: Bot):
         con.execute("DELETE FROM ugu_pending WHERE qid=?", (qid,))
 
 
+DESCRIPTION = ("👻 Угу, призрак твоих переписок: вижу всё, даже удалённое.\n\n"
+               "• «угубот, …» в своей переписке: ответ впишу в твоё сообщение\n"
+               "• «@ugu_ai вопрос» в любом чате, «@ugu_ai котики» картинки\n"
+               "• интернет, погода, курс, калькулятор\n"
+               "• напоминания, заметки, договорённости, поиск в переписке\n"
+               "• фото: что на нём, найти товар, демотиватор, шакал, жмых\n"
+               "• приколы: инфа, выбери, данет, кубик")
+
+
 async def setup_profile(bot: Bot):
     from aiogram.types import BotCommand
     for attempt in range(10):
         try:
             await bot.set_my_commands([BotCommand(command="start", description="Кто такой Угу и как звать")])
             await bot.set_my_short_description("Призрак твоих переписок: вижу всё, даже удалённое. Зови «угубот» в переписке или @ugu_ai в любом чате.")
-            await bot.set_my_description(HELP)
+            await bot.set_my_description(DESCRIPTION)
             return
         except Exception as e:
             log.warning("угу: профиль не обновил (%s): %s", attempt + 1, e)
