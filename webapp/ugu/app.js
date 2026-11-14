@@ -108,15 +108,44 @@ function hideMain() {
 
 /* ---------- маскот ---------- */
 const anims = [];
+/* призраки играют только на экране: скрытые вкладки и прокрученные мимо не тратят кадры */
+const animObs = 'IntersectionObserver' in window ? new IntersectionObserver(es => es.forEach(e => {
+  const a = e.target._anim; if (!a) return;
+  a.visible = e.isIntersecting;
+  if (a.visible && !document.hidden) a.play(); else a.pause();
+})) : null;
+document.addEventListener('visibilitychange', () => anims.forEach(a => { if (document.hidden) a.pause(); else if (a.visible !== false && !reduced) a.play(); }));
+/* 60 к/с → 30 к/с: та же скорость движения, вдвое меньше перерисовок SVG на телефоне */
+const at30cache = new Map();
+function at30(data) {
+  if (at30cache.has(data)) return structuredClone(at30cache.get(data));
+  const k = 30 / (data.fr || 30), d = structuredClone(data);
+  if (k < 1) {
+    const walk = o => {
+      if (Array.isArray(o)) return o.forEach(walk);
+      if (!o || typeof o !== 'object') return;
+      for (const key of ['t', 'ip', 'op', 'st']) if (typeof o[key] === 'number' && !(key === 't' && o.ty)) o[key] *= k;
+      for (const key in o) if (o[key] && typeof o[key] === 'object') walk(o[key]);
+    };
+    walk(d.layers); (d.assets || []).forEach(a => walk(a.layers));
+    d.ip *= k; d.op *= k; d.fr = 30;
+  }
+  at30cache.set(data, d);
+  return structuredClone(d);
+}
 function mascot(el, name = 'ghost', loop = true) {
   if (!el) return null;
   const data = window.GHOSTS && window.GHOSTS[name];
   if (!window.lottie || !data) { el.innerHTML = '<img src="assets/ugu_ghost_avatar.jpg" alt="">'; return null; }
+  if (el._anim) { const i = anims.indexOf(el._anim); if (i >= 0) anims.splice(i, 1); try { el._anim.destroy(); } catch (e) { /* ignore */ } el._anim = null; }
   el.innerHTML = '';
-  const a = window.lottie.loadAnimation({ container: el, renderer: 'svg', loop, autoplay: !reduced, animationData: structuredClone(data) });
+  const a = window.lottie.loadAnimation({ container: el, renderer: 'svg', loop, autoplay: false, animationData: at30(data),
+    rendererSettings: { progressiveLoad: true, hideOnTransparent: true } });
+  a.setSubframe(false);
   if (reduced) a.addEventListener('DOMLoaded', () => a.goToAndStop(Math.floor(a.totalFrames / 3), true));
+  else if (animObs) { a.visible = false; el._anim = a; animObs.unobserve(el); animObs.observe(el); } else a.play();
   anims.push(a);
-  for (let i = anims.length - 1; i >= 0; i--) if (!anims[i].wrapper || !anims[i].wrapper.isConnected) { try { anims[i].destroy(); } catch (e) { /* ignore */ } anims.splice(i, 1); }
+  for (let i = anims.length - 1; i >= 0; i--) if (!anims[i].wrapper || !anims[i].wrapper.isConnected) { if (animObs && anims[i].wrapper) animObs.unobserve(anims[i].wrapper); try { anims[i].destroy(); } catch (e) { /* ignore */ } anims.splice(i, 1); }
   return a;
 }
 const H = { name: '', until: 0, timer: 0 };
