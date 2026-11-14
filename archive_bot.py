@@ -251,8 +251,15 @@ def store_row(owner, msg: Message, quoted=False):
     return label, file_id, size
 
 
+def from_guest_bot(msg: Message):
+    """Ответы ботов-гостей (Угу, Mira) в переписке: в архив не кладём, это не слова людей."""
+    return bool(getattr(msg, "guest_bot_caller_user", None) or (msg.from_user and msg.from_user.is_bot))
+
+
 @router.business_message()
 async def on_message(msg: Message, bot: Bot):
+    if from_guest_bot(msg):
+        return
     owner = await resolve_owner(bot, msg.business_connection_id)
     mine = bool(msg.from_user and msg.from_user.id == owner)
     import assistant
@@ -309,7 +316,11 @@ async def save_replied(msg: Message, bot: Bot, owner):
 
 @router.edited_business_message()
 async def on_edit(msg: Message, bot: Bot):
+    if from_guest_bot(msg):
+        return
     owner = await resolve_owner(bot, msg.business_connection_id)
+    if (owner, msg.chat.id, msg.message_id) in TRIGGER_IDS:
+        return
     new_text = body_of(msg)
     with db() as con:
         row = con.execute("SELECT text FROM messages WHERE owner_id=? AND chat_id=? AND message_id=?",

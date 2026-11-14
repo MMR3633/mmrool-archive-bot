@@ -93,6 +93,18 @@ class UserClient:
                 raise
         return await self.client.get_entity(target.lstrip("@") if not target.startswith("@") else target)
 
+    async def first_messages(self, target, n=3):
+        """Самые первые сообщения переписки: [{date, out, text}]."""
+        async with self.lock:
+            entity = await self.resolve(target)
+            out = []
+            async for m in self.client.iter_messages(entity, reverse=True, limit=n * 3):
+                if m.message or m.media:
+                    out.append({"date": m.date, "out": bool(m.out), "text": m.message or f"[{media_label(m) or 'медиа'}]"})
+                if len(out) >= n:
+                    break
+            return out
+
     async def export_dialog(self, target, since=None, until=None, progress=None, image_budget=30 * 1024 * 1024):
         from io import BytesIO
         from PIL import Image

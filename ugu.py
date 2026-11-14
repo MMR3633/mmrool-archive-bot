@@ -61,6 +61,9 @@ INTENTS = [
     ("summary", r"сводк|пересказ|перескажи|о ч[её]м (мы )?(говорили|болтали|речь|переписк)|что было|кратко|итог"),
     ("voice", r"расшифр|что (он |она )?(сказал|говорит) в (гс|голосов)|текст (гс|голосов)"),
     ("photo", r"что (на|тут на|это на) (фото|картинк|скрин)|прочитай|что (тут|здесь) написано|что (это|тут) такое\??$"),
+    ("first", r"(когда|в какой день|какого числа|с какого (дня|числа))\b.{0,40}\b(познаком\w*|начали (переписыв|общать|писать)\w*|"
+              r"впервые|первый раз|написали друг другу|стали общаться|переписываемся|общаемся)|перв\w+ сообщени|"
+              r"нача\w* перепис"),
     ("find", r"^(найди|поищи|где|когда)\b.*\b(он|она|ты|я|мы|скидывал\w*|кидал\w*|писал\w*|присылал\w*|говорил\w*|"
              r"отправлял\w*|адрес\w*|ссылк\w*|номер\w*|телефон\w*)\b|в (этой )?(переписке|чате)"),
     ("web", r"\?\s*$|^(что|кто|как|почему|зачем|сколько|где|когда|какой|какая|какое|какие|каков\w*|чем|отчего|"
@@ -204,12 +207,22 @@ def has_chat(owner, chat_id):
         return bool(con.execute("SELECT 1 FROM messages WHERE owner_id=? AND chat_id=? LIMIT 1", (owner, chat_id)).fetchone())
 
 
+BOT_NOISE = re.compile(r"(?i)@ugu_ai|угу\s*-?\s*бот|^\W{0,3}(нашёл:|нашел:|кратко за|чем помочь|скинул в личку|прислал в личку|"
+                       r"я угу|не уверен, что ты|не понял|договорились:|планы на|планов на|💭|…$)")
+
+
+def is_noise(text):
+    """Вопросы к Угу и его ответы, попавшие в архив: в поиск и сводки не берём."""
+    return bool(BOT_NOISE.search(text or ""))
+
+
 def chat_rows(owner, chat_id, days, deleted=False):
     since = (now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     with ab.db() as con:
-        return [dict(r) for r in con.execute(
+        rows = [dict(r) for r in con.execute(
             "SELECT * FROM messages WHERE owner_id=? AND chat_id=? AND date >= ? AND deleted=? ORDER BY date",
             (owner, chat_id, since, int(deleted)))]
+    return [r for r in rows if not is_noise(r["text"])]
 
 
 def days_in(question, default=7):
@@ -299,8 +312,37 @@ def search(owner, words, chat_id=None, limit=3):
             sql += " AND chat_id=?"
             args.append(chat_id)
         rows = con.execute(sql + " ORDER BY date DESC LIMIT 20000", args).fetchall()
-    scored = sorted(((match_score(words, r["text"]), r) for r in rows), key=lambda x: (x[0], x[1]["date"]), reverse=True)
+    scored = sorted(((match_score(words, r["text"]), r) for r in rows if not is_noise(r["text"])),
+                    key=lambda x: (x[0], x[1]["date"]), reverse=True)
     return [r for s, r in scored if s > 0][:limit]
+
+
+async def first_answer(ctx):
+    """Когда познакомились: самое первое сообщение. С входом в аккаунт берём настоящее, иначе из архива."""
+    first = None
+    if ctx.owner == ab.OWNER_ID and ab.USER is not None and ctx.chat_id:
+        try:
+            if await ab.USER.ready():
+                msgs = await ab.USER.first_messages(ctx.chat_id, 1)
+                if msgs:
+                    m = msgs[0]
+                    first = (m["date"].astimezone(MSK).strftime("%d.%m.%Y %H:%M"), "Ты" if m["out"] else "Собеседник", m["text"])
+        except Exception as e:
+            log.warning("угу: первое сообщение из аккаунта: %s", e)
+    archived = False
+    if first is None:
+        with ab.db() as con:
+            r = con.execute("SELECT date, sender_id, sender_name, text, media_type FROM messages WHERE owner_id=? AND chat_id=?"
+                            " ORDER BY date, message_id LIMIT 1", (ctx.owner, ctx.chat_id)).fetchone()
+        if r:
+            archived = True
+            first = (f"{r['date'][8:10]}.{r['date'][5:7]}.{r['date'][:4]} {r['date'][11:16]}",
+                     "Ты" if r["sender_id"] == ctx.owner else who_name(r, ctx.owner), r["text"] or f"[{r['media_type']}]")
+    if not first:
+        return "⟪huh⟫ Не знаю, когда вы начали переписку: этого чата нет в архиве."
+    when, who, text = first
+    tail = "\n(Это первое, что есть в архиве. Раньше подключения бота не вижу.)" if archived else ""
+    return f"⟪calendar⟫ Первое сообщение: <b>{when}</b>\n{html.escape(who)}: «{html.escape((text or '')[:200])}»{tail}"
 
 
 def find_answer(ctx):
@@ -323,7 +365,7 @@ def find_answer(ctx):
             f"• {html.escape(r['chat_title'] or '')}, {r['date'][5:16]}{' 🗑' if r['deleted'] else ''}: "
             f"{html.escape(r['text'][:200])}" for r in private[:6])
         if not shown:
-            ans.public = "⟪mail⟫ Скинул в личку."
+            ans.public = "⟪mail⟫ В этом чате не нашёл, но нашёл в других. Прислал тебе в личку, чтобы собеседник не видел."
     if not ans.public and not ans.private:
         ans.public = "⟪huh⟫ В переписке такого не нашёл."
     return ans
@@ -501,7 +543,7 @@ SEM = {"clf": None, "broken": False}
 CONVO = {"chat", "help"}
 LABELS = {"schedule": "📅 Мои планы", "find": "🔎 Найти в переписке", "web": "🌐 Интернет", "promises": "🤝 Договорённости",
           "summary": "🧾 Кратко о чате", "deleted": "🗑 Удалённое", "images": "📷 Картинка", "chat": "💬 Поболтать",
-          "help": "❓ Что умею", "remind": "⏰ Напомнить", "voice": "🎤 Расшифровать ГС", "photo": "📷 Что на фото",
+          "help": "❓ Что умею", "first": "🗓 Когда познакомились", "remind": "⏰ Напомнить", "voice": "🎤 Расшифровать ГС", "photo": "📷 Что на фото",
           "look": "🖼 Как выглядит", "shop": "🛒 Где купить", "product": "🔎 Найти товар по фото"}
 MENU_TEXT = "⟪hi⟫ Чем помочь? Нажми кнопку, допиши запрос и отправь:"
 INLINE_MODE = re.compile(r"(?i)^(к|pic|картинки|картинка|фото|\?|и)\s+")
@@ -616,8 +658,12 @@ async def brain(ctx: Ctx) -> Answer:
         return Answer(public="⟪alarm⟫ Записал, напомню.")
     if kind in ("deleted", "promises", "summary") and not in_chat:
         return Answer(public="⟪sad⟫ Этот чат я не веду, поэтому по нему не подскажу.")
+    if kind == "first":
+        if not in_chat:
+            return Answer(public="⟪huh⟫ Этот чат я не веду, поэтому не знаю, когда вы начали переписку.")
+        return Answer(public=await first_answer(ctx))
     if kind == "deleted":
-        return Answer(public="⟪mail⟫ Скинул в личку.", private=deleted_answer(ctx))
+        return Answer(public="⟪mail⟫ Удалённое прислал тебе в личку, здесь его не показываю.", private=deleted_answer(ctx))
     if kind == "promises":
         return Answer(public=promises_answer(ctx))
     if kind == "summary":
@@ -797,6 +843,7 @@ async def on_owner_message(msg: Message, bot: Bot, owner):
 
 async def answer_by_name(msg: Message, bot: Bot, owner, prefix, question):
     head = html.escape(prefix)
+    ab.TRIGGER_IDS.add((owner, msg.chat.id, msg.message_id))
     thinking, err = await edit_own(bot, msg, joined(head, THINK))
     try:
         ans = await brain(Ctx(owner, question, msg.chat.id, ab.chat_title(msg.chat), msg.reply_to_message, bot))
