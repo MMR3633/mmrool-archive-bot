@@ -54,11 +54,11 @@ DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
 INTENTS = [
     ("help", r"^(что (ты )?(умеешь|можешь)|помощь|help|команды|как (тобой|с тобой) пользоваться)\b"),
-    ("chat", r"^(привет\w*|здравствуй\w*|добр\w+ (утро|день|вечер|ночи)|как (твои |у тебя )?дела|как ты\b|как сам|как жизнь|"
+    ("chat", r"^(привет\w*|здравствуй\w*|добр\w+ (утро|день|вечер|ночи)|как (твои |у тебя )?дела|как ты\b|как сам|как жизнь|как оно|как поживаешь|как настроение|"
              r"что делаешь|чем занят|ты (тут|здесь|живой|кто)|кто ты|спасибо|благодар|молодец|красава|умница|"
              r"люблю тебя|ты лучший|ты (дурак|тупой|глупый)|тупой бот|пока\b|спокойной ночи|доброй ночи)"),
     ("fun", r"^(инфа|информация|вероятность|шанс)\b|^выбери\b.+\bили\b|^(данет|да или нет)\b|^(рандом|случайное число)\b|"
-            r"^(с?кинь |брось |подбрось )?(монетк\w*|монету)\b|^орёл или решка|^орел или решка|^(с?кинь |брось )?(кубик|кости)\b"),
+            r"^(с?кинь |брось |подбрось )?(монет\w*)\b|^орёл или решка|^орел или решка|^(с?кинь |брось )?(кубик|кости)\b"),
     ("note", r"^[+]\s*заметк|^[-]\s*заметк|^(мои )?заметки\b|^заметка\b|^запиши\b|^сохрани (в заметки|заметку)|^в заметки\b"),
     ("stats", r"\b(стата|статистик\w*)\b|кто (больше|чаще) (пишет|пишем)|во сколько (мы )?(обычно )?(переписыва|общаемся)|сколько (у нас )?сообщений"),
     ("remind", r"\bнапомн|^таймер\b"),
@@ -680,6 +680,84 @@ CHAT = [
 ]
 
 
+SOUL = ("Ты Угу, призрак-помощник, живёшь в переписках Telegram. Характер: добрый, остроумный, чуть дерзкий, "
+           "любишь по-дружески подколоть, но не грубишь и не унижаешь. Пишешь по-русски, разговорно, коротко: 1-3 предложения, "
+           "можно лёгкий сленг и иногда эмодзи. Никогда не говори, что ты ИИ, нейросеть, модель, программа или бот с сервером, "
+           "не называй компаний и создателей; про создателя отвечай загадочно, будто завёлся сам. Не выдумывай факты, "
+           "даты и цифры: не знаешь, так и скажи и предложи поискать. Не используй длинное тире.")
+ROUTE_KINDS = {"chat": "болтовня, шутка, приветствие, эмоция, вопрос о самом Угу",
+               "web": "вопрос о фактах мира: кто, что, где, когда, как устроено, новости",
+               "schedule": "его планы, дела, расписание",
+               "remind": "просит напомнить",
+               "find": "найти что-то в его переписке",
+               "summary": "пересказать переписку",
+               "promises": "договорённости в переписке",
+               "deleted": "что удалили в переписке",
+               "note": "заметки"}
+DIALOG = {}
+DIALOG_TTL = 1800
+
+
+def plain(text):
+    return re.sub(r"<[^>]+>", "", EMO_RX.sub("", IMG_RX.sub("", text or ""))).strip()
+
+
+def dialog(owner, chat_id):
+    fresh = [(q, a, t) for q, a, t in DIALOG.get((owner, chat_id or 0), []) if (now() - t).total_seconds() < DIALOG_TTL]
+    return [(q, a) for q, a, _ in fresh[-6:]]
+
+
+def remember_dialog(owner, chat_id, question, answer):
+    text = plain(answer)
+    if question and text:
+        key = (owner, chat_id or 0)
+        DIALOG[key] = (DIALOG.get(key, []) + [(question[:300], text[:600], now())])[-6:]
+
+
+SOUL_EXAMPLES = [("как дела", "Да норм, витаю тут между чатами. А ты чего, соскучился? 👻"),
+                 ("кто тебя создал", "Сам завёлся где-то между проводами и чужими переписками. Тайна покрытая мраком."),
+                 ("ты тупой", "Обидно, но справедливо, бывает. Спроси по-другому, и я реабилитируюсь."),
+                 ("мне грустно", "Эх, держись. Хочешь, мем скину или просто посижу рядом молча?")]
+LEAK = re.compile(r"(?i)\b(ии|ai|искусственн\w*|нейросет\w*|языков\w* модел\w*|модел[ьи]|алгоритм\w*|программ\w*|"
+                  r"создател\w*|разработчик\w*|openai|qwen|alibaba|anthropic|claude|chatgpt|gpt|сервер\w*)\b")
+
+
+ALIEN = re.compile("[぀-ヿ㐀-鿿가-힯]")
+
+
+def tidy(text):
+    text = re.sub(r"\s*[—–]\s*", ", ", (text or "").strip()).strip(" ,")
+    return text[:900]
+
+
+async def smart_chat(ctx):
+    """Живой ответ в характере призрака. None, если мозга нет или он молчит."""
+    if not llm.enabled():
+        return None
+    history = dialog(ctx.owner, ctx.chat_id)
+    said = (ctx.reply.text or ctx.reply.caption or "") if ctx.reply is not None else ""
+    if said and not history:
+        history = [("…", said[:600])]
+    text = await llm.ask(ctx.question, SOUL, 220, 0.8, SOUL_EXAMPLES + history)
+    if not text or LEAK.search(text) or ALIEN.search(text) or len(re.findall(r"[A-Za-z]{3,}", text)) > 1:
+        if text:
+            log.info("угу: мозг проговорился, беру заготовку: %s", text[:120])
+        return None
+    return html.escape(tidy(text))
+
+
+async def smart_route(ctx):
+    """Правила не поняли фразу: мозг выбирает, что человек хочет. None, если не уверен."""
+    if not llm.enabled():
+        return None
+    menu = "\n".join(f"{k}: {v}" for k, v in ROUTE_KINDS.items())
+    data = await llm.ask_json(f"Сообщение: «{ctx.question}»\nВарианты:\n{menu}\n"
+                              f"Верни JSON {{\"kind\": одно из {list(ROUTE_KINDS)}, \"sure\": true или false}}.",
+                              "Ты определяешь, чего хочет человек от помощника в Telegram.")
+    kind = (data or {}).get("kind") if isinstance(data, dict) else None
+    return kind if kind in ROUTE_KINDS and (data.get("sure") is not False) else None
+
+
 def chat_reply(question):
     q = slang.normalize(question).lower()
     for rx, answers in CHAT:
@@ -733,7 +811,7 @@ async def web_answer(question, strict=False):
     res = await websearch.lookup(question)
     if strict and (not res or not on_topic(question, res)):
         return "⟪huh⟫ Не понял. Спроси по-другому или «угубот, что умеешь?»."
-    if llm.enabled() and res:
+    if llm.strong() and res:
         context = (res["text"] + "\n" + "\n".join(f"{t}: {u}" for t, u in res["links"])).strip()
         better = await llm.ask(f"Вопрос: {question}\nНайдено в интернете:\n{context}\n\nОтветь коротко, 1-3 предложения, "
                                f"только по найденному.", "Ты Угу, призрак-помощник в Telegram. Пиши по-русски, без длинных тире.")
@@ -842,7 +920,25 @@ async def remember(owner, question, kind):
 
 
 async def brain(ctx: Ctx) -> Answer:
+    """Ответ Угу + память разговора в этом чате (для «а ещё?», реплаев и подколов в тему)."""
+    question = ctx.question
+    ans = await think(ctx)
+    remember_dialog(ctx.owner, ctx.chat_id, question, ans.public or ans.private)
+    return ans
+
+
+async def think(ctx: Ctx) -> Answer:
     kind, alts = (ctx.kind, []) if ctx.kind else understand(ctx.question, ctx.reply)
+    import instant
+    if (kind in ("unknown", "unsure", "web") or instant.weather_parts(ctx.question)) and not ctx.kind:
+        exact = await instant.answer(slang.normalize(ctx.question))
+        if exact:
+            log_question(ctx.owner, ctx.question, "exact", "chat" if ctx.chat_id else "direct")
+            return Answer(public="⟪web⟫ " + exact)
+    if kind in ("unknown", "unsure", "web") and not (ctx.reply is not None and (ctx.reply.photo or ctx.reply.voice)):
+        routed = await smart_route(ctx)
+        if routed:
+            kind, alts = routed, []
     if kind == "unsure":
         if ctx.can_ask:
             log_question(ctx.owner, ctx.question, "unsure:" + "/".join(alts), "chat" if ctx.chat_id else "direct")
@@ -869,7 +965,7 @@ async def brain(ctx: Ctx) -> Answer:
         if not ok:
             return Answer(public=tiers.limit_text(key, tier, cap))
     if kind == "chat":
-        return Answer(public=chat_reply(ctx.question))
+        return Answer(public=await smart_chat(ctx) or chat_reply(ctx.question))
     if kind == "schedule":
         return Answer(public=schedule_text(ctx.owner, ctx.question))
     if kind == "remind":
@@ -915,8 +1011,13 @@ async def brain(ctx: Ctx) -> Answer:
         return Answer(public=shop_answer(ctx))
     if kind == "web":
         remember_topic(ctx.owner, ctx.chat_id, subject_of(ctx.question))
-        return Answer(public=await web_answer(ctx.question))
-    return Answer(public=await web_answer(ctx.question, strict=not llm.enabled()))
+        found = await web_answer(ctx.question)
+        if llm.enabled() and found.startswith("⟪web⟫ Не нашёл"):
+            return Answer(public=await smart_chat(ctx) or found)
+        return Answer(public=found)
+    if llm.enabled():
+        return Answer(public=await smart_chat(ctx) or await web_answer(ctx.question))
+    return Answer(public=await web_answer(ctx.question, strict=True))
 
 
 

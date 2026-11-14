@@ -24,7 +24,7 @@ def agent(url):
 async def http_get(url, params=None, headers=None, timeout=12):
     import aiohttp
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as s:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout), trust_env=True) as s:
             async with s.get(url, params=params, headers={"User-Agent": agent(url), "Accept-Language": "ru,en;q=0.8",
                                                           **(headers or {})}) as r:
                 return r.status, await r.text()

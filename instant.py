@@ -194,9 +194,9 @@ async def weather(question):
         return f"Не нашёл город «{city}». Напиши, например: «погода в Казани на неделю»."
     lat, lon, name, country = place
     status, body = await websearch.http_get("https://api.open-meteo.com/v1/forecast", {
-        "latitude": lat, "longitude": lon, "timezone": "auto", "forecast_days": 7,
+        "latitude": lat, "longitude": lon, "timezone": "auto", "forecast_days": 9,
         "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
-        "daily": "time,temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"})
+        "daily": "temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max"})
     try:
         d = json.loads(body)
         day = d["daily"]
@@ -216,7 +216,10 @@ async def weather(question):
         dates = day.get("time") or []
         idx = list(range(min(n, days or 7)))
         if when == "weekend" and dates:
-            idx = [i for i in range(n) if datetime.fromisoformat(dates[i]).weekday() >= 5] or idx
+            ends = [i for i in range(n) if datetime.fromisoformat(dates[i]).weekday() >= 5]
+            if ends:
+                first = ends[0]
+                idx = [first] + ([first + 1] if datetime.fromisoformat(dates[first]).weekday() == 5 and first + 1 < n else [])
         labels = []
         for i in idx:
             if dates:

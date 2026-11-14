@@ -165,7 +165,7 @@ async def create_reminder(bot: Bot, owner, text, context=""):
     title = clean_title(text)
     when, rest, vague = parse_when(title)
     title = clean_title(rest)
-    if when is None and llm.enabled():
+    if when is None and llm.strong():
         data = await llm.ask_json(
             f"Сейчас {iso(now())} (Москва). Фраза: «{text}». Верни JSON {{\"when\": \"YYYY-MM-DD HH:MM\" или null, "
             f"\"title\": короткое название}}.", "Ты разбираешь напоминания на русском.")
@@ -825,7 +825,7 @@ async def gather(owner, who=None, chat_ids=None, days=7):
 async def promises_text(owner, rows, title):
     if not rows:
         return f"По чату {html.escape(title)} за этот период сообщений нет."
-    if llm.enabled():
+    if llm.strong():
         res = await llm.ask("Вот переписка:\n" + llm.transcript(rows, owner) +
                             "\n\nВыпиши все договорённости и обещания: кто, что, к какому сроку. Коротко, списком.",
                             "Ты личный помощник. Пиши по-русски, без длинных тире.")
@@ -842,7 +842,7 @@ async def promises_text(owner, rows, title):
 async def summary_text(owner, rows, title, days):
     if not rows:
         return f"По чату {html.escape(title)} за {days} дн. сообщений нет."
-    if llm.enabled():
+    if llm.strong():
         res = await llm.ask("Вот переписка:\n" + llm.transcript(rows, owner) +
                             f"\n\nПерескажи коротко, о чём говорили за последние {days} дн.: главные темы, решения, "
                             f"открытые вопросы. 5-10 пунктов.", "Ты личный помощник. Пиши по-русски, без длинных тире.")
