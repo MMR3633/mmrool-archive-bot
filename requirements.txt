@@ -5,3 +5,7 @@ pillow
 faster-whisper
 av
 numpy
+onnxruntime
+tokenizers
+rapidocr
+opencv-python-headless

@@ -1,0 +1,597 @@
+import asyncio
+import hashlib
+import html
+import logging
+import re
+from dataclasses import dataclass, field
+from datetime import timedelta
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+from aiogram.types import (InlineQuery, InlineQueryResultArticle, InlineQueryResultPhoto, InputMediaPhoto,
+                           InputTextMessageContent, LinkPreviewOptions, Message)
+
+import archive_bot as ab
+import llm
+import websearch
+from textutil import match_score, promises, stems, summary
+from timeparse import MSK
+
+log = logging.getLogger("archive.ugu")
+router = Router()
+UGU = {"bot": None, "username": "ugu_ai", "guest": None}
+
+NAME_ANY = re.compile(r"(?i)(?<![\w@])(?:угу\s*-?\s*бот\w*|угубот\w*|@ugu_ai)(?!\w)[\s,:!.\-]*")
+NAME_LEAD = re.compile(r"(?i)^\s*угу\s*[,:!]\s*(.+)$", re.S)
+THINK = "🦉 …"
+SHORT = 700
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+INTENTS = [
+    ("help", r"^(привет\w*|здаров\w*|хай|ты кто|кто ты|что (ты )?умеешь|помощь|help|команды)\b"),
+    ("remind", r"\bнапомн"),
+    ("deleted", r"удал[её]н|удалил|удалили|стёр|стер\b|стерли|стёрли"),
+    ("schedule", r"расписан|\bпланы?\b|\bдела\b|что (у меня )?(на|по) (сегодня|завтра|недел)|напоминани|\bзадач"),
+    ("promises", r"обещ|договорил|договорён|договорен"),
+    ("summary", r"сводк|пересказ|перескажи|о ч[её]м (мы )?(говорили|болтали|речь|переписк)|что было|кратко|итог"),
+    ("voice", r"расшифр|что (он |она )?(сказал|говорит) в (гс|голосов)|текст (гс|голосов)"),
+    ("images", r"^(картинк\w*|фотк\w*|покажи (фото|картинк|как выгляд)\w*)\b|^(фото|пик|pic)\s"),
+    ("photo", r"что (на|тут на|это на) (фото|картинк|скрин)|прочитай|что (тут|здесь) написано|что (это|тут) такое\??$"),
+    ("find", r"^(найди|поищи|где|когда)\b.*\b(он|она|ты|я|мы|скидывал\w*|кидал\w*|писал\w*|присылал\w*|говорил\w*|"
+             r"отправлял\w*|адрес\w*|ссылк\w*|номер\w*|телефон\w*)\b|в (этой )?(переписке|чате)"),
+    ("web", r"\?\s*$|^(что|кто|как|почему|зачем|сколько|где|когда|какой|какая|какое|какие|каков\w*|чем|отчего|"
+            r"найди|поищи|загугли|погугли|расскажи|объясни|подскажи)\b"),
+]
+INTENTS = [(name, re.compile(rx, re.I)) for name, rx in INTENTS]
+EXPLICIT = {"remind", "deleted", "schedule", "images", "summary", "promises", "find"}
+STRONG = {"help", "remind", "deleted", "schedule", "promises", "summary", "voice", "images", "photo", "find"}
+FIND_WORDS = re.compile(r"(?i)\b(найди|поищи|где|когда|он|она|ты|я|мы|мне|в (этой )?(переписке|чате)|скидывал\w*|кидал\w*|"
+                        r"писал\w*|присылал\w*|говорил\w*|отправлял\w*)\b")
+IMAGE_WORDS = re.compile(r"(?i)^(картинк\w*|фотк\w*|покажи|фото|пик|pic)\s+((фото|картинк\w*|как выгляд\w*)\s+)?")
+
+HELP = ("🦉 Я Угу, сова-помощник. Зови по имени:\n"
+        "• в своей переписке: «угубот, что у меня на неделе?», ответ впишу прямо в твоё сообщение;\n"
+        "• в любом чате: «@ugu_ai вопрос», отвечу сам;\n"
+        "• «@ugu_ai котики» в строке ввода: картинки, выбирай и отправляй.\n\n"
+        "Умею: расписание и напоминания, о чём договорились, что обещали, найти в переписке, "
+        "что удалили (только тебе в личку), расшифровать ГС, что на фото, ответ из интернета со ссылками.")
+
+
+@dataclass
+class Ctx:
+    owner: int
+    question: str
+    chat_id: int | None = None
+    chat_title: str = ""
+    reply: Message | None = None
+    file_bot: Bot | None = None
+
+
+@dataclass
+class Answer:
+    public: str = ""
+    private: str = ""
+    images: list = field(default_factory=list)
+
+
+def intent(question, reply=None):
+    q = (question or "").strip()
+    if reply is not None:
+        explicit = any(rx.search(q) for name, rx in INTENTS if name in EXPLICIT)
+        if not explicit and (reply.photo or (reply.document and (reply.document.mime_type or "").startswith("image/"))):
+            return "photo"
+        if not explicit and (reply.voice or reply.video_note):
+            return "voice"
+    if not q:
+        return "help"
+    for name, rx in INTENTS:
+        if rx.search(q):
+            return name
+    return "unknown"
+
+
+def find_call(text):
+    """(часть до имени, вопрос) если в сообщении позвали Угу, иначе None."""
+    t = text or ""
+    m = NAME_ANY.search(t)
+    if m:
+        before, after = t[:m.start()].rstrip(" ,:;-"), t[m.end():].strip()
+        if not re.search(r"\w", after):
+            after = ""
+        if after:
+            return before, after
+        if before:
+            return "", before
+        return "", ""
+    m = NAME_LEAD.match(t)
+    if m and intent(m.group(1)) in STRONG:
+        return "", m.group(1).strip()
+    return None
+
+
+def allowed(user_id):
+    return bool(user_id) and (user_id == ab.OWNER_ID or ab.owner_has_archive(user_id))
+
+
+def now():
+    from datetime import datetime
+    return datetime.now(MSK)
+
+
+def has_chat(owner, chat_id):
+    if not chat_id:
+        return False
+    with ab.db() as con:
+        return bool(con.execute("SELECT 1 FROM messages WHERE owner_id=? AND chat_id=? LIMIT 1", (owner, chat_id)).fetchone())
+
+
+def chat_rows(owner, chat_id, days, deleted=False):
+    since = (now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with ab.db() as con:
+        return [dict(r) for r in con.execute(
+            "SELECT * FROM messages WHERE owner_id=? AND chat_id=? AND date >= ? AND deleted=? ORDER BY date",
+            (owner, chat_id, since, int(deleted)))]
+
+
+def days_in(question, default=7):
+    import assistant
+    q = question or ""
+    if re.search(r"(?i)сегодня", q):
+        return 1
+    if re.search(r"(?i)\bмесяц", q):
+        return 30
+    return assistant.period_days(q, default)
+
+
+def who_name(r, owner):
+    return "Я" if r["sender_id"] == owner else (r["sender_name"] or "собеседник").split(" (@")[0]
+
+
+# ---------- ответы по архиву ----------
+
+def schedule_text(owner, question):
+    q = question.lower()
+    start = now()
+    if "завтра" in q:
+        start = (start + timedelta(days=1)).replace(hour=0, minute=0, second=0)
+        end = start + timedelta(days=1)
+        span = "на завтра"
+    elif "сегодня" in q:
+        end = start.replace(hour=23, minute=59, second=59)
+        span = "на сегодня"
+    else:
+        end = start + timedelta(days=30 if "месяц" in q else 7)
+        span = "на месяц" if "месяц" in q else "на неделю"
+    with ab.db() as con:
+        rems = con.execute("SELECT title, due FROM reminders WHERE owner_id=? AND status='active' AND due BETWEEN ? AND ?"
+                           " ORDER BY due", (owner, start.strftime("%Y-%m-%d %H:%M:%S"),
+                                             end.strftime("%Y-%m-%d %H:%M:%S"))).fetchall()
+        tasks = con.execute("SELECT text FROM tasks WHERE owner_id=? AND done=0 ORDER BY id DESC LIMIT 5", (owner,)).fetchall()
+    lines = []
+    for r in rems[:12]:
+        from datetime import datetime
+        d = datetime.strptime(r["due"], "%Y-%m-%d %H:%M:%S")
+        lines.append(f"{DAYS[d.weekday()]} {d:%d.%m %H:%M} {html.escape(r['title'])}")
+    if tasks:
+        lines.append("Задачи: " + "; ".join(html.escape((t["text"] or "")[:60]) for t in tasks))
+    if not lines:
+        return f"🦉 Планов {span} у меня нет. Добавить: «угубот, напомни в пт 18:00 созвон»."
+    return f"🦉 Планы {span}:\n" + "\n".join(lines)
+
+
+def promises_answer(ctx):
+    rows = chat_rows(ctx.owner, ctx.chat_id, days_in(ctx.question, 30))
+    found = promises(rows, ctx.owner)
+    if not found:
+        return "🦉 Договорённостей и сроков в этом чате не вижу."
+    lines = [f"• {html.escape(who)}: {html.escape(s[:140])}{' (' + html.escape(dl) + ')' if dl else ''}"
+             for who, d, s, dl in found[-6:]]
+    return "🦉 Договорились:\n" + "\n".join(lines)
+
+
+def summary_answer(ctx):
+    days = days_in(ctx.question, 7)
+    rows = chat_rows(ctx.owner, ctx.chat_id, days)
+    if not rows:
+        return f"🦉 За {days} дн. в этом чате сообщений нет."
+    s = summary(rows, ctx.owner, limit=5)
+    lines = [f"🦉 Кратко за {days} дн.: {s['total']} сообщ., темы: {html.escape(', '.join(s['top_words'][:5])) or 'нет'}."]
+    for r in s["key"]:
+        lines.append(f"• {r['date'][8:10]}.{r['date'][5:7]} {html.escape(who_name(r, ctx.owner))}: "
+                     f"{html.escape((r['text'] or '')[:120])}")
+    return "\n".join(lines)
+
+
+def deleted_answer(ctx):
+    rows = chat_rows(ctx.owner, ctx.chat_id, days_in(ctx.question, 30), deleted=True)
+    if not rows:
+        return "🦉 В этом чате за это время ничего не удаляли."
+    lines = [f"🗑 Удалённое в чате {html.escape(ctx.chat_title)}:"]
+    for r in rows[-15:]:
+        media = f" [{r['media_type']}]" if r["media_type"] else ""
+        lines.append(f"• {r['date'][5:16]} {html.escape(who_name(r, ctx.owner))}{media}: {html.escape((r['text'] or '')[:200])}")
+    return "\n".join(lines)
+
+
+def search(owner, words, chat_id=None, limit=3):
+    with ab.db() as con:
+        sql, args = "SELECT * FROM messages WHERE owner_id=? AND text IS NOT NULL AND text != ''", [owner]
+        if chat_id:
+            sql += " AND chat_id=?"
+            args.append(chat_id)
+        rows = con.execute(sql + " ORDER BY date DESC LIMIT 20000", args).fetchall()
+    scored = sorted(((match_score(words, r["text"]), r) for r in rows), key=lambda x: (x[0], x[1]["date"]), reverse=True)
+    return [r for s, r in scored if s > 0][:limit]
+
+
+def find_answer(ctx):
+    words = stems(FIND_WORDS.sub(" ", ctx.question))
+    if not words:
+        return Answer(public="🦉 Что искать? Например: «угубот, найди адрес».")
+    hits = search(ctx.owner, words, ctx.chat_id, 6) if ctx.chat_id else []
+    shown = [r for r in hits if not r["deleted"]][:3]
+    hidden = [r for r in hits if r["deleted"]]
+    if shown:
+        lines = [f"• {r['date'][8:10]}.{r['date'][5:7]} {html.escape(who_name(r, ctx.owner))}: {html.escape(r['text'][:200])}"
+                 for r in shown]
+        ans = Answer(public="🦉 Нашёл:\n" + "\n".join(lines))
+    else:
+        ans = Answer()
+    others = [r for r in search(ctx.owner, words, None, 6) if r["chat_id"] != ctx.chat_id] if not shown else []
+    private = hidden + others
+    if private:
+        ans.private = "🦉 Нашёл (видишь только ты):\n" + "\n".join(
+            f"• {html.escape(r['chat_title'] or '')}, {r['date'][5:16]}{' 🗑' if r['deleted'] else ''}: "
+            f"{html.escape(r['text'][:200])}" for r in private[:6])
+        if not shown:
+            ans.public = "📩 Скинул в личку."
+    if not ans.public and not ans.private:
+        ans.public = "🦉 В переписке такого не нашёл."
+    return ans
+
+
+# ---------- медиа ----------
+
+async def download(bot, obj, name, ext):
+    path = ab.TMP / f"{name}{ext}"
+    ab.TMP.mkdir(parents=True, exist_ok=True)
+    for attempt in range(3):
+        try:
+            await bot.download(obj.file_id, destination=path)
+            return path
+        except Exception as e:
+            log.warning("угу: не скачал файл (%s): %s", attempt + 1, e)
+            await asyncio.sleep(2)
+    return None
+
+
+async def photo_answer(ctx):
+    src = ctx.reply
+    obj = (src.photo[-1] if src.photo else src.document) if src else None
+    if not obj or not ctx.file_bot:
+        return "🦉 Ответь этим на фото, и я посмотрю."
+    if obj.file_size and obj.file_size > ab.MAX_DOWNLOAD:
+        return "🦉 Фото слишком большое, больше 20 МБ не беру."
+    try:
+        import vision
+    except Exception as e:
+        log.warning("угу: распознавание фото недоступно: %s", e)
+        return "🦉 Смотреть фото сейчас не могу: модуль распознавания не установлен."
+    path = await download(ctx.file_bot, obj, f"ugu_{src.chat.id}_{src.message_id}", ".jpg")
+    if not path:
+        return "🦉 Не смог скачать фото, попробуй ещё раз."
+    try:
+        res = await asyncio.to_thread(vision.analyze, str(path), str(ab.DATA / "vision"))
+        return "🦉 " + html.escape(vision.describe(res))
+    except Exception as e:
+        log.warning("угу: фото не разобрал: %s", e)
+        return "🦉 Не получилось разобрать фото."
+    finally:
+        path.unlink(missing_ok=True)
+
+
+async def voice_answer(ctx):
+    src = ctx.reply
+    obj = (src.voice or src.video_note) if src else None
+    if not obj or not ctx.file_bot:
+        return "🦉 Ответь этим на голосовое, и я расшифрую."
+    import assistant
+    if assistant.WHISPER["broken"]:
+        return "🦉 Расшифровка сейчас недоступна."
+    path = await download(ctx.file_bot, obj, f"ugu_stt_{src.chat.id}_{src.message_id}", ".ogg" if src.voice else ".mp4")
+    if not path:
+        return "🦉 Не смог скачать голосовое."
+    try:
+        async with assistant.VOICE_SEM:
+            text = await asyncio.to_thread(assistant._transcribe, str(path))
+        return "🦉 📝 " + html.escape(text or "(без слов)")
+    except Exception as e:
+        log.warning("угу: не расшифровал: %s", e)
+        return "🦉 Не получилось расшифровать."
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def image_query(question):
+    return IMAGE_WORDS.sub("", question or "").strip(" ?!.,") or question
+
+
+# ---------- мозг ----------
+
+async def web_answer(question):
+    res = await websearch.lookup(question)
+    if llm.enabled() and res:
+        context = (res["text"] + "\n" + "\n".join(f"{t}: {u}" for t, u in res["links"])).strip()
+        better = await llm.ask(f"Вопрос: {question}\nНайдено в интернете:\n{context}\n\nОтветь коротко, 1-3 предложения, "
+                               f"только по найденному.", "Ты Угу, сова-помощник в Telegram. Пиши по-русски, без длинных тире.")
+        if better:
+            res = {**res, "text": better}
+    return "🦉 " + websearch.format_answer(res)
+
+
+async def brain(ctx: Ctx) -> Answer:
+    kind = intent(ctx.question, ctx.reply)
+    in_chat = has_chat(ctx.owner, ctx.chat_id)
+    log.info("угу: %s от %s: %s", kind, ctx.owner, ctx.question[:80])
+    if kind == "help":
+        return Answer(public=HELP)
+    if kind == "schedule":
+        return Answer(public=schedule_text(ctx.owner, ctx.question))
+    if kind == "remind":
+        import assistant
+        await assistant.create_reminder(ab_bot(), ctx.owner, ctx.question, f"чат с {ctx.chat_title}" if ctx.chat_title else "")
+        return Answer(public="🦉 Записал, напомню.")
+    if kind in ("deleted", "promises", "summary") and not in_chat:
+        return Answer(public="🦉 Этот чат я не веду, поэтому по нему не подскажу.")
+    if kind == "deleted":
+        return Answer(public="📩 Скинул в личку.", private=deleted_answer(ctx))
+    if kind == "promises":
+        return Answer(public=promises_answer(ctx))
+    if kind == "summary":
+        return Answer(public=summary_answer(ctx))
+    if kind == "find":
+        return find_answer(ctx if in_chat else Ctx(ctx.owner, ctx.question, None, ctx.chat_title))
+    if kind == "voice":
+        return Answer(public=await voice_answer(ctx))
+    if kind == "photo":
+        return Answer(public=await photo_answer(ctx))
+    if kind == "images":
+        q = image_query(ctx.question)
+        found = await websearch.images(q, 4)
+        return Answer(public=f"🦉 {html.escape(q)}" if found else "🦉 Картинок не нашёл.", images=found)
+    if kind == "web" or (kind == "unknown" and llm.enabled()):
+        return Answer(public=await web_answer(ctx.question))
+    return Answer(private="🦉 Не понял вопрос. Спроси «угубот, что умеешь?».")
+
+
+def ab_bot():
+    return BOTS["archive"]
+
+
+BOTS = {"archive": None}
+
+
+# ---------- зов по имени в своей переписке (бизнес-чат архив-бота) ----------
+
+def joined(head, body):
+    return f"{head}\n{body}" if head and body else (head or body)
+
+
+async def edit_own(bot: Bot, msg: Message, text):
+    for attempt in range(3):
+        try:
+            await bot.edit_message_text(text, business_connection_id=msg.business_connection_id, chat_id=msg.chat.id,
+                                        message_id=msg.message_id, link_preview_options=NO_PREVIEW)
+            return True, ""
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                return True, ""
+            if ab.is_network(e) and attempt < 2:
+                await asyncio.sleep(2)
+                continue
+            return False, str(e)
+    return False, "сеть"
+
+
+async def send_in_chat(bot: Bot, msg: Message, text):
+    try:
+        await bot.send_message(msg.chat.id, text, business_connection_id=msg.business_connection_id,
+                               link_preview_options=NO_PREVIEW)
+        return True
+    except Exception as e:
+        log.warning("угу: не написал в чат: %s", e)
+        return False
+
+
+async def drop_own(bot: Bot, msg: Message, owner):
+    ab.TRIGGER_IDS.add((owner, msg.chat.id, msg.message_id))
+    try:
+        await bot.delete_business_messages(business_connection_id=msg.business_connection_id, message_ids=[msg.message_id])
+    except Exception as e:
+        log.warning("угу: не убрал своё сообщение: %s", e)
+
+
+async def send_album(bot: Bot, msg: Message, images, caption):
+    media = [InputMediaPhoto(media=url, caption=caption if i == 0 else None) for i, (url, *_rest) in enumerate(images[:4])]
+    try:
+        await bot.send_media_group(msg.chat.id, media, business_connection_id=msg.business_connection_id)
+        return True
+    except Exception as e:
+        log.warning("угу: альбом не ушёл: %s", e)
+        return False
+
+
+async def on_owner_message(msg: Message, bot: Bot, owner):
+    if not msg.text or msg.via_bot:
+        return False
+    call = find_call(msg.text)
+    if call is None:
+        return False
+    BOTS["archive"] = BOTS["archive"] or bot
+    asyncio.create_task(answer_by_name(msg, bot, owner, *call))
+    return True
+
+
+async def answer_by_name(msg: Message, bot: Bot, owner, prefix, question):
+    head = html.escape(prefix)
+    thinking, err = await edit_own(bot, msg, joined(head, THINK))
+    try:
+        ans = await brain(Ctx(owner, question, msg.chat.id, ab.chat_title(msg.chat), msg.reply_to_message, bot))
+    except Exception as e:
+        log.exception("угу: ошибка")
+        ans = Answer(private=f"🦉 Сломался на вопросе «{html.escape(question[:100])}»: {html.escape(str(e)[:200])}")
+    if ans.private:
+        ab.notify(owner, ans.private)
+    public = ans.public
+    if ans.images and await send_album(bot, msg, ans.images, html.unescape(re.sub(r"<[^>]+>", "", public))):
+        public = ""
+    if not thinking:
+        if public and not await send_in_chat(bot, msg, public):
+            ab.notify(owner, public)
+        if err and "rights" in err.lower() or "forbidden" in (err or "").lower():
+            ab.notify(owner, "🦉 Не могу править твои сообщения: Настройки → Telegram для бизнеса → Чат-боты → "
+                             "@mmrool_archive_bot → включи «Отвечать на сообщения».")
+        return
+    if public and len(public) <= SHORT:
+        ok, _ = await edit_own(bot, msg, joined(head, public))
+        if not ok and not await send_in_chat(bot, msg, public):
+            ab.notify(owner, public)
+        return
+    if head:
+        await edit_own(bot, msg, head)
+    else:
+        await drop_own(bot, msg, owner)
+    if public and not await send_in_chat(bot, msg, public):
+        ab.notify(owner, public)
+
+
+# ---------- @ugu_ai: гостевой режим, inline-картинки, личка ----------
+
+def strip_name(text):
+    return NAME_ANY.sub(" ", text or "").strip()
+
+
+def article(text):
+    return InlineQueryResultArticle(id=hashlib.md5(text.encode()).hexdigest()[:16], title="Угу",
+                                    input_message_content=InputTextMessageContent(message_text=text,
+                                                                                  link_preview_options=NO_PREVIEW))
+
+
+def photo_results(images):
+    out = []
+    for url, thumb, w, h, title in images:
+        out.append(InlineQueryResultPhoto(id=hashlib.md5(url.encode()).hexdigest()[:20], photo_url=url, thumbnail_url=thumb,
+                                          photo_width=w or None, photo_height=h or None))
+    return out
+
+
+@router.guest_message()
+async def on_guest(msg: Message, bot: Bot):
+    caller = msg.from_user.id if msg.from_user else 0
+    question = strip_name(msg.text or msg.caption)
+    if not allowed(caller):
+        await bot.answer_guest_query(msg.guest_query_id, article(
+            f"🦉 Я Угу, помощник. Работаю для своих, подключиться: t.me/{UGU['username']}"))
+        return
+    kind = intent(question, msg.reply_to_message)
+    if kind == "images":
+        found = await websearch.images(image_query(question), 1)
+        if found:
+            await bot.answer_guest_query(msg.guest_query_id, photo_results(found)[0])
+            return
+    sent = await bot.answer_guest_query(msg.guest_query_id, article(THINK))
+    chat_id = msg.chat.id if has_chat(caller, msg.chat.id) else None
+    try:
+        ans = await brain(Ctx(caller, question, chat_id, ab.chat_title(msg.chat), msg.reply_to_message, bot))
+    except Exception as e:
+        log.exception("угу: ошибка в гостевом ответе")
+        ans = Answer(public="🦉 Что-то сломалось, попробуй ещё раз.")
+    if ans.private:
+        ab.notify(caller, ans.private)
+    public = ans.public or ("📩 Скинул в личку." if ans.private else "🦉 Готово.")
+    if len(public) > 4000:
+        public = public[:3990] + "…"
+    try:
+        await bot.edit_message_text(public, inline_message_id=sent.inline_message_id, link_preview_options=NO_PREVIEW)
+    except Exception as e:
+        log.warning("угу: не обновил гостевой ответ: %s", e)
+
+
+@router.inline_query()
+async def on_inline(query: InlineQuery, bot: Bot):
+    text = (query.query or "").strip()
+    if not allowed(query.from_user.id) or len(text) < 2 or intent(text) not in ("unknown", "images"):
+        await query.answer([], cache_time=5, is_personal=True)
+        return
+    found = await websearch.images(image_query(text), 20)
+    await query.answer(photo_results(found), cache_time=300, is_personal=False)
+
+
+@router.message(CommandStart())
+async def ugu_start(msg: Message):
+    if allowed(msg.from_user.id):
+        await msg.answer(HELP + "\n\nМожно и тут: спроси что угодно, пришли фото или голосовое.")
+    else:
+        await msg.answer("🦉 Я Угу, сова-помощник. Работаю для тех, кто подключил архив @mmrool_archive_bot "
+                         "(Настройки → Telegram для бизнеса → Чат-боты).")
+
+
+@router.message(F.chat.type == "private")
+async def ugu_private(msg: Message, bot: Bot):
+    if not allowed(msg.from_user.id):
+        return
+    question = strip_name(msg.text or msg.caption or "")
+    reply = msg if (msg.photo or msg.voice or msg.video_note or msg.document) else msg.reply_to_message
+    wait = await msg.answer(THINK)
+    ans = await brain(Ctx(msg.from_user.id, question, None, "", reply, bot))
+    text = "\n\n".join(x for x in (ans.public, ans.private) if x) or "🦉 Готово."
+    if ans.images:
+        try:
+            await bot.send_media_group(msg.chat.id, [InputMediaPhoto(media=u) for u, *_ in ans.images[:4]])
+        except Exception as e:
+            log.warning("угу: альбом в личку: %s", e)
+    try:
+        await bot.edit_message_text(text[:4000], chat_id=msg.chat.id, message_id=wait.message_id,
+                                    link_preview_options=NO_PREVIEW)
+    except Exception:
+        await msg.answer(text[:4000], link_preview_options=NO_PREVIEW)
+
+
+async def setup_profile(bot: Bot):
+    from aiogram.types import BotCommand
+    try:
+        await bot.set_my_commands([BotCommand(command="start", description="Кто такой Угу и как звать")])
+        await bot.set_my_short_description("Сова-помощник. Зови «угубот» в переписке или @ugu_ai в любом чате.")
+        await bot.set_my_description(HELP)
+    except Exception as e:
+        log.warning("угу: профиль не обновил: %s", e)
+
+
+async def run(token, archive_bot: Bot):
+    BOTS["archive"] = archive_bot
+    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    UGU["bot"] = bot
+    dp = Dispatcher()
+    dp.include_router(router)
+    while True:
+        try:
+            me = await bot.me()
+            UGU["username"], UGU["guest"] = me.username, me.supports_guest_queries
+            break
+        except Exception as e:
+            log.warning("угу: Telegram не отвечает (%s), повтор через 15 сек", e)
+            await asyncio.sleep(15)
+    log.info("угу: @%s на связи, гостевой режим %s", UGU["username"], "включён" if UGU["guest"] else "ВЫКЛЮЧЕН в BotFather")
+    asyncio.create_task(setup_profile(bot))
+    while True:
+        try:
+            await bot.delete_webhook(drop_pending_updates=False)
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), handle_signals=False)
+            break
+        except Exception as e:
+            log.warning("угу: опрос упал (%s), перезапуск через 15 сек", e)
+            await asyncio.sleep(15)

@@ -1048,6 +1048,9 @@ async def handle_business(msg: Message, bot: Bot, owner, mine):
             await ab.remove_trigger(msg, bot, owner)
             await add_task(bot, owner, msg.reply_to_message)
             return True
+        import ugu
+        if await ugu.on_owner_message(msg, bot, owner):
+            return True
         m = CMD_RX.match(text)
         if m:
             await ab.remove_trigger(msg, bot, owner)

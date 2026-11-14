@@ -25,6 +25,7 @@ MEDIA = DATA / "media"
 TMP = DATA / "tmp"
 DB_PATH = DATA / "archive.db"
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+UGU_TOKEN = os.environ.get("UGU_TOKEN", "")
 OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
 STORE_CHAT_ID = int(os.environ.get("STORE_CHAT_ID", "0"))
 WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
@@ -1023,6 +1024,11 @@ async def main():
     asyncio.create_task(setup_menu(bot))
     asyncio.create_task(janitor())
     asyncio.create_task(assistant.loops(bot))
+    if UGU_TOKEN:
+        import ugu
+        asyncio.create_task(ugu.run(UGU_TOKEN, bot))
+    else:
+        log.info("угу: UGU_TOKEN не задан, @ugu_ai не запускаю")
     while True:
         try:
             await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
