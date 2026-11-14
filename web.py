@@ -251,6 +251,8 @@ def make_app(bot):
     app.router.add_get("/api/media", media)
     app.router.add_post("/api/send", send_to_chat)
     app.router.add_get("/pub/{name}", pub)
+    import miniapp
+    miniapp.setup(app)
     return app
 
 

@@ -109,6 +109,7 @@ def init_db():
         con.execute("CREATE INDEX IF NOT EXISTS idx_msg_store ON messages(store_file_id)")
         con.execute("CREATE TABLE IF NOT EXISTS bot_users (user_id INTEGER, bot TEXT, seen TEXT, PRIMARY KEY (user_id, bot))")
         con.execute("CREATE TABLE IF NOT EXISTS conn_bot (id TEXT PRIMARY KEY, bot TEXT)")
+        con.execute("CREATE TABLE IF NOT EXISTS prefs (owner_id INTEGER, key TEXT, value INTEGER, PRIMARY KEY (owner_id, key))")
         for table, column in (("edits", "owner_id INTEGER"), ("outbox", "ref_owner INTEGER"),
                               ("outbox", "ref_chat INTEGER"), ("outbox", "ref_msg INTEGER"), ("outbox", "via TEXT"),
                               ("messages", "recv_bot TEXT"), ("messages", "store_bot TEXT")):
@@ -120,7 +121,9 @@ def init_db():
         for row in con.execute("SELECT id, user_id FROM connections"):
             CONN_OWNER[row["id"]] = row["user_id"]
     import assistant
+    import tiers
     assistant.init_db()
+    tiers.init_db()
 
 
 def now():
@@ -421,7 +424,7 @@ async def on_edit(msg: Message, bot: Bot):
                         (owner, msg.chat.id, msg.message_id))
         if file_id:
             asyncio.create_task(archive_row(bot, owner, msg.chat.id, msg.message_id))
-    if (msg.from_user and msg.from_user.id == owner) or old_text == new_text:
+    if (msg.from_user and msg.from_user.id == owner) or old_text == new_text or not pref(owner, "notify_edited"):
         return
     was = html.escape(old_text) if old_text is not None else "<i>не было в архиве</i>"
     notify(owner,
@@ -446,6 +449,8 @@ async def on_delete(event: BusinessMessagesDeleted, bot: Bot):
             con.execute("UPDATE messages SET deleted=1, deleted_at=? WHERE owner_id=? AND chat_id=? AND message_id=?",
                         (now(), owner, event.chat.id, mid))
             rows.append((mid, row))
+    if not pref(owner, "notify_deleted"):
+        return
     lines = [f"🗑 В чате <b>{html.escape(chat_title(event.chat))}</b> удалено {len(rows)} сообщ."]
     for mid, row in rows:
         if not row:
@@ -623,6 +628,16 @@ async def sender(bot: Bot, once=False):
                 if item["kind"] != "text":
                     con.execute("INSERT INTO outbox (chat_id, kind, text, created) VALUES (?,?,?,?)",
                                 (item["chat_id"], "text", f"Файл не смог переслать: {html.escape(str(e))}", now()))
+
+
+def pref(owner, key, default=1):
+    """Настройка владельца из мини-аппа (уведомлять об удалённом / изменённом)."""
+    try:
+        with db() as con:
+            row = con.execute("SELECT value FROM prefs WHERE owner_id=? AND key=?", (owner, key)).fetchone()
+    except sqlite3.OperationalError:
+        return default
+    return row["value"] if row else default
 
 
 def owner_has_archive(user_id):
@@ -1153,8 +1168,12 @@ def build_dispatcher():
     """Один диспетчер на оба бота. Порядок: приветствие Угу, архив, помощник, inline архива, группы, Угу (последним: ловит всё в личке)."""
     import assistant
     import inline
+    import tiers
     import ugu
     assistant.init_db()
+    tiers.init_db()
+    tiers.router.message.filter(OnBot("ugu"))
+    tiers.router.pre_checkout_query.filter(OnBot("ugu"))
     dp = Dispatcher()
 
     @dp.update.outer_middleware()
@@ -1167,6 +1186,7 @@ def build_dispatcher():
                 log.warning("bot_users: %s", e)
         return await handler(event, data)
 
+    dp.include_router(tiers.router)
     dp.include_router(ugu.start_router)
     dp.include_router(router)
     dp.include_router(assistant.router)

@@ -22,6 +22,7 @@ from aiogram.types import (BufferedInputFile, CallbackQuery, InlineKeyboardButto
 import archive_bot as ab
 import llm
 import slang
+import tiers
 import websearch
 from textutil import match_score, promises, stems, summary
 from timeparse import MSK
@@ -373,6 +374,9 @@ def fun_answer(question):
     return "⟪huh⟫ Умею: «инфа что завтра дождь», «выбери пицца или суши», «данет», «рандом 1 100», «монетка», «кубик»."
 
 
+NOTE_ADD = re.compile(r"(?i)^([+]\s*заметк\w*|запиши( в заметки)?|сохрани (в заметки|заметку)|в заметки)\s*:?\s*(.*)$", re.S)
+
+
 def notes_table(con):
     con.execute("CREATE TABLE IF NOT EXISTS ugu_notes (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, title TEXT, "
                 "body TEXT, created TEXT, pinned INTEGER DEFAULT 0)")
@@ -391,7 +395,7 @@ def note_answer(ctx):
                 return Answer(public=f"⟪huh⟫ Заметку «{html.escape(key)}» не нашёл. Список: «заметки».")
             con.execute("DELETE FROM ugu_notes WHERE id=?", (row["id"],))
             return Answer(public=f"⟪trash⟫ Удалил заметку «{html.escape(row['title'])}».")
-        m = re.match(r"(?i)^([+]\s*заметк\w*|запиши( в заметки)?|сохрани (в заметки|заметку)|в заметки)\s*:?\s*(.*)$", q, re.S)
+        m = NOTE_ADD.match(q)
         if m and m.group(4).strip():
             body = m.group(4).strip()
             title, _, rest = body.partition("\n")
@@ -453,26 +457,31 @@ async def fx_answer(ctx):
     if not path:
         return Answer(public="⟪sad⟫ Не смог скачать фото.")
     try:
+        data = await fx_file(path, kind, rest)
+    finally:
+        path.unlink(missing_ok=True)
+    return Answer(photo=data) if data else Answer(public="⟪sad⟫ Эффект не получился, попробуй другое фото.")
+
+
+async def fx_file(path, kind, rest=""):
+    """Эффект над файлом: шакал / жмых / демотиватор / текст. JPEG-байты или b""."""
+    try:
         import fx
         fonts = str(ab.DATA / "fonts")
         if kind.startswith("шакал"):
-            data = await asyncio.to_thread(fx.shakal, str(path))
-        elif kind.startswith("жмых"):
-            data = await asyncio.to_thread(fx.zhmykh, str(path))
-        elif kind.startswith("демо") or kind.startswith("демк"):
+            return await asyncio.to_thread(fx.shakal, str(path))
+        if kind.startswith("жмых"):
+            return await asyncio.to_thread(fx.zhmykh, str(path))
+        if kind.startswith("демо") or kind.startswith("демк"):
             title, _, sub = (rest or "когда понял, что это демотиватор").partition("|")
-            data = await asyncio.to_thread(fx.demotivator, str(path), title.strip(), sub.strip(), fonts)
-        else:
-            top, sep, bottom = rest.partition("|")
-            if not sep:
-                top, bottom = "", rest
-            data = await asyncio.to_thread(fx.meme_text, str(path), top.strip(), bottom.strip(), fonts)
+            return await asyncio.to_thread(fx.demotivator, str(path), title.strip(), sub.strip(), fonts)
+        top, sep, bottom = rest.partition("|")
+        if not sep:
+            top, bottom = "", rest
+        return await asyncio.to_thread(fx.meme_text, str(path), top.strip(), bottom.strip(), fonts)
     except Exception as e:
         log.warning("угу: эффект не получился: %s", e)
-        return Answer(public="⟪sad⟫ Эффект не получился, попробуй другое фото.")
-    finally:
-        path.unlink(missing_ok=True)
-    return Answer(photo=data)
+        return b""
 
 
 async def first_answer(ctx):
@@ -551,22 +560,27 @@ async def photo_answer(ctx):
         return "⟪huh⟫ Ответь этим на фото, и я посмотрю."
     if obj.file_size and obj.file_size > ab.MAX_DOWNLOAD:
         return "⟪sad⟫ Фото слишком большое, больше 20 МБ не беру."
+    path = await download(ctx.file_bot, obj, f"ugu_{src.chat.id}_{src.message_id}", ".jpg")
+    if not path:
+        return "⟪sad⟫ Не смог скачать фото, попробуй ещё раз."
+    try:
+        return await describe_file(path)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+async def describe_file(path):
     try:
         import vision
     except Exception as e:
         log.warning("угу: распознавание фото недоступно: %s", e)
         return "⟪sad⟫ Смотреть фото сейчас не могу: модуль распознавания не установлен."
-    path = await download(ctx.file_bot, obj, f"ugu_{src.chat.id}_{src.message_id}", ".jpg")
-    if not path:
-        return "⟪sad⟫ Не смог скачать фото, попробуй ещё раз."
     try:
         res = await asyncio.to_thread(vision.analyze, str(path), str(ab.DATA / "vision"))
         return "⟪photo⟫ " + html.escape(vision.describe(res))
     except Exception as e:
         log.warning("угу: фото не разобрал: %s", e)
         return "⟪sad⟫ Не получилось разобрать фото."
-    finally:
-        path.unlink(missing_ok=True)
 
 
 async def voice_answer(ctx):
@@ -836,6 +850,19 @@ async def brain(ctx: Ctx) -> Answer:
     log.info("угу: %s от %s: %s", kind, ctx.owner, ctx.question[:80])
     if kind == "help":
         return Answer(public=HELP.replace("👻", "⟪hi⟫", 1))
+    ok, tier, cap = tiers.use(ctx.owner, "ask")
+    if not ok:
+        return Answer(public=tiers.limit_text("ask", tier, cap))
+    if kind in ("remind", "note"):
+        key = "plans" if kind == "remind" else "notes"
+        ok, tier, cap = tiers.room(ctx.owner, key)
+        if not ok and (kind == "remind" or NOTE_ADD.match(ctx.question)):
+            return Answer(public=tiers.limit_text(key, tier, cap))
+    if kind in ("fx", "photo", "product") and ctx.reply and (ctx.reply.photo or ctx.reply.document):
+        key = "fx" if kind == "fx" else "photo"
+        ok, tier, cap = tiers.use(ctx.owner, key)
+        if not ok:
+            return Answer(public=tiers.limit_text(key, tier, cap))
     if kind == "chat":
         return Answer(public=chat_reply(ctx.question))
     if kind == "schedule":
@@ -878,13 +905,26 @@ async def brain(ctx: Ctx) -> Answer:
         q, found = await pick_images(ctx.question, ctx.owner, ctx.chat_id)
         return Answer(public=f"⟪photo⟫ {html.escape(q)}" if found else "⟪sad⟫ Картинок не нашёл.", images=found)
     if kind == "look":
-        return Answer(public=await look_answer(ctx))
+        ok, tier, cap = tiers.use(ctx.owner, "web")
+        return Answer(public=await look_answer(ctx) if ok else tiers.limit_text("web", tier, cap))
     if kind == "shop":
         return Answer(public=shop_answer(ctx))
     if kind == "web":
         remember_topic(ctx.owner, ctx.chat_id, subject_of(ctx.question))
-        return Answer(public=await web_answer(ctx.question))
-    return Answer(public=await web_answer(ctx.question, strict=not llm.enabled()))
+        return Answer(public=await counted_web(ctx))
+    return Answer(public=await counted_web(ctx, strict=not llm.enabled()))
+
+
+async def counted_web(ctx, strict=False):
+    """Точные ответы (курс, погода, калькулятор) без лимита, поиск в интернете по лимиту тарифа."""
+    import instant
+    exact = await instant.answer(ctx.question)
+    if exact:
+        return "⟪web⟫ " + exact
+    ok, tier, cap = tiers.use(ctx.owner, "web")
+    if not ok:
+        return tiers.limit_text("web", tier, cap)
+    return await web_answer(ctx.question, strict)
 
 
 async def look_answer(ctx):
@@ -950,23 +990,27 @@ async def product_answer(ctx):
     if not path:
         return "⟪sad⟫ Не смог скачать фото, попробуй ещё раз."
     try:
-        try:
-            import vision
-            res = await asyncio.to_thread(vision.analyze, str(path), str(ab.DATA / "vision"))
-            seen = vision.describe(res)
-        except Exception as e:
-            log.warning("угу: умная камера без распознавания: %s", e)
-            res, seen = {}, ""
-        url = publish_photo(path)
+        return await product_file(path, ctx.owner, ctx.chat_id)
     finally:
         path.unlink(missing_ok=True)
+
+
+async def product_file(path, owner, chat_id=None):
+    try:
+        import vision
+        res = await asyncio.to_thread(vision.analyze, str(path), str(ab.DATA / "vision"))
+        seen = vision.describe(res)
+    except Exception as e:
+        log.warning("угу: умная камера без распознавания: %s", e)
+        res, seen = {}, ""
+    url = publish_photo(path)
     query = product_query(res)
     lines = [f"⟪find⟫ {html.escape(seen)}" if seen else "⟪find⟫ Ищу по фото."]
     if url:
         lines.append(f'🔎 Найти по фото: <a href="https://yandex.ru/images/search?rpt=imageview&url={quote_plus(url)}">Яндекс</a> · '
                      f'<a href="https://lens.google.com/uploadbyurl?url={quote_plus(url)}">Google</a>')
     if query:
-        remember_topic(ctx.owner, ctx.chat_id, query)
+        remember_topic(owner, chat_id, query)
         lines.append(shop_links(query))
     return "\n".join(lines)
 
@@ -1213,11 +1257,14 @@ async def on_menu_help(call: CallbackQuery, bot: Bot):
 
 @start_router.message(CommandStart())
 async def ugu_start(msg: Message):
+    gift = tiers.on_start(msg.from_user.id, (msg.text or "").partition(" ")[2].strip())
+    gift = f"\n\n{gift}" if gift else ""
     if allowed(msg.from_user.id):
-        await say(msg.answer, HELP.replace("👻", "⟪hi⟫", 1) + "\n\nМожно и тут: спроси что угодно, пришли фото или голосовое.")
+        await say(msg.answer, HELP.replace("👻", "⟪hi⟫", 1) + "\n\nМожно и тут: спроси что угодно, пришли фото или голосовое."
+                  + gift)
     else:
-        await say(msg.answer, "⟪ghost⟫ Я Угу, призрак-помощник. Работаю для тех, кто подключил архив @mmrool_archive_bot "
-                              "(Настройки → Telegram для бизнеса → Чат-боты).")
+        await say(msg.answer, "⟪ghost⟫ Я Угу, призрак твоих переписок. Подключи меня: Настройки → Telegram для бизнеса → "
+                              "Чат-боты → @ugu_ai, включи «Удаление сообщений». Потом открой кнопку «Угу» внизу." + gift)
 
 
 @router.message(F.chat.type == "private")
