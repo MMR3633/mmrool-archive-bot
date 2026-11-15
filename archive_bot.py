@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 from contextlib import contextmanager
 
 if __name__ == "__main__":
@@ -33,6 +34,7 @@ WEBAPP_URL = os.environ.get("WEBAPP_URL", "")
 WEB_PORT = int(os.environ.get("PORT") or os.environ.get("WEB_PORT") or "0")
 TG_PROXY = os.environ.get("TG_PROXY", "")
 MAX_DOWNLOAD = 20 * 1024 * 1024
+DL_GIVE_UP = 30
 MSK = timezone(timedelta(hours=3))
 
 log = logging.getLogger("archive")
@@ -114,6 +116,7 @@ def init_db():
         con.execute("CREATE TABLE IF NOT EXISTS prefs (owner_id INTEGER, key TEXT, value INTEGER, PRIMARY KEY (owner_id, key))")
         for table, column in (("edits", "owner_id INTEGER"), ("outbox", "ref_owner INTEGER"),
                               ("outbox", "ref_chat INTEGER"), ("outbox", "ref_msg INTEGER"), ("outbox", "via TEXT"),
+                              ("outbox", "wait_until REAL DEFAULT 0"),
                               ("messages", "recv_bot TEXT"), ("messages", "store_bot TEXT")):
             try:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
@@ -255,6 +258,8 @@ async def download(bot: Bot, name, file_id, size, ext, tries=3):
             return str(target)
         except Exception as e:
             log.warning("не скачал файл %s (попытка %s): %s", name, attempt + 1, e)
+            if "too big" in str(e).lower():
+                raise FileTooBig(str(e))
             if attempt + 1 < tries:
                 await asyncio.sleep(3)
     return None
@@ -519,7 +524,13 @@ async def archive_row(bot: Bot, owner, chat_id, message_id):
         local = row["file_path"]
         path = local if local and Path(local).exists() else None
         if not path:
-            path = await download(bot, f"{owner}_{chat_id}_{message_id}", row["file_id"], None, row["ext"] or "")
+            try:
+                path = await download(bot, f"{owner}_{chat_id}_{message_id}", row["file_id"], None, row["ext"] or "")
+            except FileTooBig:
+                with db() as con:
+                    con.execute("UPDATE messages SET dl_tries=? WHERE owner_id=? AND chat_id=? AND message_id=?",
+                                (DL_GIVE_UP, *key))
+                return False
         if not path:
             with db() as con:
                 con.execute("UPDATE messages SET dl_tries=dl_tries+1 WHERE owner_id=? AND chat_id=? AND message_id=?", key)
@@ -552,7 +563,7 @@ async def archiver(bot: Bot, once=False):
     while True:
         with db() as con:
             rows = con.execute("SELECT owner_id, chat_id, message_id, recv_bot FROM messages WHERE file_id IS NOT NULL"
-                               " AND store_file_id IS NULL AND dl_tries < 30 ORDER BY date DESC LIMIT 10").fetchall()
+                               " AND store_file_id IS NULL AND dl_tries < ? ORDER BY date DESC LIMIT 10", (DL_GIVE_UP,)).fetchall()
         for r in rows:
             await archive_row(bot_by(r["recv_bot"] or "archive", bot), r["owner_id"], r["chat_id"], r["message_id"])
         if once:
@@ -566,8 +577,8 @@ async def deliver(bot: Bot, item):
         await bot.send_message(chat_id, text, reply_markup=None)
         return
     ref = (item["ref_owner"], item["ref_chat"], item["ref_msg"])
-    query = ("SELECT store_file_id, store_kind, store_msg_id, store_bot, recv_bot FROM messages WHERE owner_id=? AND chat_id=?"
-             " AND message_id=?")
+    query = ("SELECT store_file_id, store_kind, store_msg_id, store_bot, recv_bot, dl_tries FROM messages WHERE owner_id=?"
+             " AND chat_id=? AND message_id=?")
     with db() as con:
         row = con.execute(query, ref).fetchone()
     if row and not row["store_file_id"]:
@@ -577,6 +588,10 @@ async def deliver(bot: Bot, item):
     if not row:
         return
     if not row["store_file_id"]:
+        if row["dl_tries"] >= DL_GIVE_UP:
+            await bot.send_message(chat_id, f"{text}\n\n⚠️ Файл не сохранился: Telegram не отдаёт ботам файлы больше 20 МБ."
+                                            " Он остался в самом чате.", parse_mode=None)
+            return
         raise FileNotReady("файл ещё не в хранилище")
     if (row["store_bot"] or "archive") != bot_name(bot) and row["store_msg_id"]:
         await bot.copy_message(chat_id, STORE_CHAT_ID, row["store_msg_id"],
@@ -603,6 +618,10 @@ class FileNotReady(Exception):
     pass
 
 
+class FileTooBig(Exception):
+    pass
+
+
 def is_network(e):
     from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
     return isinstance(e, (TelegramNetworkError, TelegramRetryAfter, TelegramServerError, FileNotReady,
@@ -612,7 +631,8 @@ def is_network(e):
 async def sender(bot: Bot, once=False):
     while True:
         with db() as con:
-            item = con.execute("SELECT * FROM outbox ORDER BY id LIMIT 1").fetchone()
+            item = con.execute("SELECT * FROM outbox ORDER BY COALESCE(wait_until, 0) > ?, id LIMIT 1",
+                               (time.time(),)).fetchone()
         if not item:
             if once:
                 return
@@ -623,6 +643,10 @@ async def sender(bot: Bot, once=False):
             with db() as con:
                 con.execute("DELETE FROM outbox WHERE id=?", (item["id"],))
         except Exception as e:
+            if isinstance(e, FileNotReady) and (item["wait_until"] or 0) <= time.time() and item["tries"] < 500:
+                with db() as con:
+                    con.execute("UPDATE outbox SET tries=tries+1, wait_until=? WHERE id=?", (time.time() + 60, item["id"]))
+                continue
             if is_network(e) and item["tries"] < 500:
                 log.warning("нет связи с Telegram, повтор: %s", e)
                 with db() as con:
