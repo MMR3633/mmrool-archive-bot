@@ -1245,6 +1245,10 @@ def photo_results(images):
 @router.guest_message()
 async def on_guest(msg: Message, bot: Bot):
     caller = msg.from_user.id if msg.from_user else 0
+    raw = (msg.text or msg.caption or "").strip()
+    if len(raw) > CALL_MAX and not MENTION.match(raw):
+        log.info("угу: упоминание внутри длинного текста, не зов (%s знаков)", len(raw))
+        return
     question = strip_name(msg.text or msg.caption)
     if not allowed(caller):
         await say(lambda t: bot.answer_guest_query(msg.guest_query_id, article(t)),
