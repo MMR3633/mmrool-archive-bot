@@ -663,8 +663,22 @@ async def static(request):
     return web.FileResponse(target, headers={**w.HEADERS, "Cache-Control": "no-cache"})
 
 
+def gzip_assets():
+    """Сжатые копии js/css/json рядом с оригиналом: aiohttp сам отдаёт .gz, на медленной связи апп грузится в разы быстрее."""
+    import gzip
+    for f in ROOT.rglob("*"):
+        if f.suffix in (".js", ".css", ".html", ".json") and "shots" not in f.parts:
+            gz = f.with_name(f.name + ".gz")
+            if not gz.exists() or gz.stat().st_mtime < f.stat().st_mtime:
+                gz.write_bytes(gzip.compress(f.read_bytes(), 9))
+
+
 def setup(app):
     init_db()
+    try:
+        gzip_assets()
+    except OSError as e:
+        ab.log.warning("мини-апп: не сжал файлы: %s", e)
     r = app.router
     r.add_get("/u", lambda request: web.HTTPFound("/u/"))
     r.add_get("/u/", index)
