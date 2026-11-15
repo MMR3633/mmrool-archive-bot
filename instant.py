@@ -161,7 +161,10 @@ WHEN = [(re.compile(r"(?i)\bна\s+(эту\s+|всю\s+)?недел\w*|\bна\s+
         (re.compile(r"(?i)\bзавтра\b"), "tomorrow"),
         (re.compile(r"(?i)\b(сейчас|сегодня|щас)\b"), "now")]
 WEATHER_WORD = re.compile(r"(?i)\bпогод\w*")
-FILLER = re.compile(r"(?i)\b(какая|какой|какую|как|там|будет|скажи|подскажи|покажи|а|ну|прогноз\w*|пожалуйста|плз|в|во|на|для|по|у)\b")
+IN_CITY = re.compile(r"\b[вВ]о?\s+([А-ЯЁ][\w-]+(?:\s+[А-ЯЁ][\w-]+)?)")
+FILLER = re.compile(r"(?i)\b(какая|какой|какую|как|там|будет|скажи|подскажи|покажи|а|ну|прогноз\w*|пожалуйста|плз|в|во|на|для|по|у|"
+                    r"и|дай|дайте|распиши|скинь|кинь|напиши|глянь|посмотри|узнай|хочу|мне|нам|нас|мол|ка|же|бы|"
+                    r"угу|угубот|бот)\b")
 WD = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 
 
@@ -180,7 +183,10 @@ def weather_parts(question):
             q = rx.sub(" ", q)
     city = re.sub(r"\s+", " ", FILLER.sub(" ", WEATHER_WORD.sub(" ", q))).strip(" ,-")
     if len(city) > 40 or len(city.split()) > 3:
-        return None
+        m = IN_CITY.search(q)
+        if not m:
+            return None
+        city = m.group(1)
     return when, city or "Москва", days
 
 
